@@ -1,0 +1,25 @@
+#include <cinttypes>
+
+#ifndef COMMON_H
+#define COMMON_H
+
+#define LOG(level, fmt, ...)  fprintf(stderr, fmt "\n", ##__VA_ARGS__) 
+#define DIE(fmt, ...)  \
+    do { \
+        fprintf(stderr, fmt "\n", ##__VA_ARGS__); \
+        exit(-1); \
+    } while (0)
+
+#define ERROR 0
+#define WARNING 1
+
+static __inline __attribute__((always_inline))
+uint64_t
+rdtsc()
+{
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a" (lo), "=d" (hi));
+    return (((uint64_t)hi << 32) | lo);
+}
+
+#endif  // COMMON_H
