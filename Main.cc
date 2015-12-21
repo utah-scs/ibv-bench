@@ -87,6 +87,10 @@ BufferDescriptor txDescriptors[MAX_TX_QUEUE_DEPTH];
 
 std::vector<BufferDescriptor*> freeTxBuffers{};
 
+uintptr_t logMemoryBase = 0;
+size_t logMemoryBytes = 0;
+ibv_mr* logMemoryRegion;
+
 // XXX Lobotomized for now.
 class Address {
     int physicalPort;   // physical port number on local device
@@ -996,22 +1000,108 @@ bool setup(bool isServer, const char* hostName)
                      "failed to create transmit completion queue");
 }
 
-/*
+const char*
+wcStatusToString(int status)
+{
+    static const char *lookup[] = {
+        "SUCCESS",
+        "LOC_LEN_ERR",
+        "LOC_QP_OP_ERR",
+        "LOC_EEC_OP_ERR",
+        "LOC_PROT_ERR",
+        "WR_FLUSH_ERR",
+        "MW_BIND_ERR",
+        "BAD_RESP_ERR",
+        "LOC_ACCESS_ERR",
+        "REM_INV_REQ_ERR",
+        "REM_ACCESS_ERR",
+        "REM_OP_ERR",
+        "RETRY_EXC_ERR",
+        "RNR_RETRY_EXC_ERR",
+        "LOC_RDD_VIOL_ERR",
+        "REM_INV_RD_REQ_ERR",
+        "REM_ABORT_ERR",
+        "INV_EECN_ERR",
+        "INV_EEC_STATE_ERR",
+        "FATAL_ERR",
+        "RESP_TIMEOUT_ERR",
+        "GENERAL_ERR"
+    };
+
+    if (status < IBV_WC_SUCCESS || status > IBV_WC_GENERAL_ERR)
+        return "<status out of range!>";
+    return lookup[status];
+}
+
+int
+reapTxBuffers()
+{
+    ibv_wc retArray[MAX_TX_QUEUE_DEPTH];
+    int n = ibv_poll_cq(commonTxCq, MAX_TX_QUEUE_DEPTH, retArray);
+
+    for (int i = 0; i < n; i++) {
+        BufferDescriptor* bd =
+            reinterpret_cast<BufferDescriptor*>(retArray[i].wr_id);
+        freeTxBuffers.push_back(bd);
+
+        if (retArray[i].status != IBV_WC_SUCCESS) {
+            LOG(ERROR, "Transmit failed for buffer %lu: %s",
+                reinterpret_cast<uint64_t>(bd),
+                wcStatusToString(retArray[i].status));
+        }
+    }
+
+    return n;
+}
+
+BufferDescriptor*
+getTransmitBuffer()
+{
+    // if we've drained our free tx buffer pool, we must wait.
+    while (freeTxBuffers.empty()) {
+        reapTxBuffers();
+
+        if (freeTxBuffers.empty()) {
+            // We are temporarily out of buffers. Time how long it takes
+            // before a transmit buffer becomes available again (a long
+            // time could indicate deadlock); in the normal case this code
+            // is not invoked.
+            uint64_t start = rdtsc();
+            while (freeTxBuffers.empty())
+                reapTxBuffers();
+            uint64_t wait = rdtsc() - start;
+            if (wait > 3lu * 5 * 1000 * 1000)  {
+                LOG(WARNING, "Long delay waiting for transmit buffers "
+                        "(%lu ticks); deadlock or target crashed?", wait);
+            }
+        }
+    }
+
+    BufferDescriptor* bd = freeTxBuffers.back();
+    freeTxBuffers.pop_back();
+    return bd;
+}
+
+struct Chunk {
+    void* p;
+    uint32_t len;
+};
+
 void
-sendZeroCopy(uint64_t nonce, Buffer* message, QueuePair* qp)
+sendZeroCopy(uint64_t nonce, Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp)
 {
     const bool allowZeroCopy = true;
-    uint32_t lastChunkIndex = message->getNumberChunks() - 1;
+    uint32_t lastChunkIndex = chunkCount - 1;
     ibv_sge isge[MAX_TX_SGE_COUNT];
 
     uint32_t chunksUsed = 0;
     uint32_t sgesUsed = 0;
     BufferDescriptor* bd = getTransmitBuffer();
-    bd->messageBytes = message->size();
+    bd->messageBytes = messageLen;
 
-    bool printStats = message->size() > 1024 * 1024;
+    bool printStats = messageLen > 1024 * 1024;
     if (printStats)
-        LOG(ERROR, "Transmitting large message size %u", message->size());
+        LOG(ERROR, "Transmitting large message size %u", messageLen);
 
     // The variables below allow us to collect several chunks from the
     // Buffer into a single sge in some situations. They describe a
@@ -1026,11 +1116,12 @@ sendZeroCopy(uint64_t nonce, Buffer* message, QueuePair* qp)
     int chunksToZeroCopy = 0;
     int chunksZeroCopied = 0;
 
-    Buffer::Iterator it(message);
-    while (!it.isDone()) {
-        const uintptr_t addr = reinterpret_cast<const uintptr_t>(it.getData());
+    for (uint32_t i = 0 ; i < chunkCount; ++i) {
+        Chunk& chunk = message[i];
+
+        const uintptr_t addr = reinterpret_cast<const uintptr_t>(chunk.p);
         if (addr >= logMemoryBase &&
-            (addr + it.getLength()) <= (logMemoryBase + logMemoryBytes))
+            (addr + chunk.len) <= (logMemoryBase + logMemoryBytes))
         {
             ++chunksToZeroCopy;
         }
@@ -1052,13 +1143,13 @@ sendZeroCopy(uint64_t nonce, Buffer* message, QueuePair* qp)
             (sgesUsed <= MAX_TX_SGE_COUNT - 4 ||
              chunksUsed == lastChunkIndex) &&
             addr >= logMemoryBase &&
-            (addr + it.getLength()) <= (logMemoryBase + logMemoryBytes) &&
-            it.getLength() > 500)
+            (addr + chunk.len) <= (logMemoryBase + logMemoryBytes) &&
+            chunk.len > 500)
         {
             if (unaddedStart != unaddedEnd) {
                 isge[sgesUsed] = {
                     reinterpret_cast<uint64_t>(unaddedStart),
-                    downCast<uint32_t>(unaddedEnd - unaddedStart),
+                    uint32_t(unaddedEnd - unaddedStart),
                     bd->mr->lkey
                 };
                 ++sgesUsed;
@@ -1067,22 +1158,21 @@ sendZeroCopy(uint64_t nonce, Buffer* message, QueuePair* qp)
 
             isge[sgesUsed] = {
                 addr,
-                it.getLength(),
+                chunk.len,
                 logMemoryRegion->lkey
             };
             ++sgesUsed;
             ++chunksZeroCopied;
         } else {
-            memcpy(unaddedEnd, it.getData(), it.getLength());
-            unaddedEnd += it.getLength();
+            memcpy(unaddedEnd, chunk.p, chunk.len);
+            unaddedEnd += chunk.len;
         }
-        it.next();
         ++chunksUsed;
     }
     if (unaddedStart != unaddedEnd) {
         isge[sgesUsed] = {
             reinterpret_cast<uint64_t>(unaddedStart),
-            downCast<uint32_t>(unaddedEnd - unaddedStart),
+            uint32_t(unaddedEnd - unaddedStart),
             bd->mr->lkey
         };
         ++sgesUsed;
@@ -1102,7 +1192,7 @@ sendZeroCopy(uint64_t nonce, Buffer* message, QueuePair* qp)
     // We can get a substantial latency improvement (nearly 2usec less per RTT)
     // by inlining data with the WQE for small messages. The Verbs library
     // automatically takes care of copying from the SGEs to the WQE.
-    if ((message->size()) <= Infiniband::MAX_INLINE_DATA)
+    if (messageLen <= MAX_INLINE_DATA)
         txWorkRequest.send_flags |= IBV_SEND_INLINE;
 
     if (printStats) {
@@ -1111,22 +1201,17 @@ sendZeroCopy(uint64_t nonce, Buffer* message, QueuePair* qp)
                 "Zero-copyable regions: %d\n"
                 "Zero-copied regions: %d\n\n"
                 "SGEs used: %u"
-                , message->size()
+                , messageLen
                 , chunksToZeroCopy
                 , chunksZeroCopied
                 , chunksUsed);
     }
 
     ibv_send_wr* badTxWorkRequest;
-    for (int i = 0; i < txWorkRequest.num_sge; ++i) {
-        const ibv_sge& sge = txWorkRequest.sg_list[i];
-        TEST_LOG("isge[%d]: %u bytes %s", i, sge.length,
-                 (logMemoryRegion && sge.lkey ==
-                    logMemoryRegion->lkey) ?
-                 "ZERO-COPY" : "COPIED");
+    if (ibv_post_send(qp->qp, &txWorkRequest, &badTxWorkRequest)) {
+        DIE("ibv_post_send failed");
     }
 }
-*/
 
 /**
  * Asychronously transmit the packet described by 'bd' on queue pair 'qp'.
@@ -1191,39 +1276,6 @@ postSend(QueuePair* qp, BufferDescriptor *bd, uint32_t length,
     }
 }
 
-const char*
-wcStatusToString(int status)
-{
-    static const char *lookup[] = {
-        "SUCCESS",
-        "LOC_LEN_ERR",
-        "LOC_QP_OP_ERR",
-        "LOC_EEC_OP_ERR",
-        "LOC_PROT_ERR",
-        "WR_FLUSH_ERR",
-        "MW_BIND_ERR",
-        "BAD_RESP_ERR",
-        "LOC_ACCESS_ERR",
-        "REM_INV_REQ_ERR",
-        "REM_ACCESS_ERR",
-        "REM_OP_ERR",
-        "RETRY_EXC_ERR",
-        "RNR_RETRY_EXC_ERR",
-        "LOC_RDD_VIOL_ERR",
-        "REM_INV_RD_REQ_ERR",
-        "REM_ABORT_ERR",
-        "INV_EECN_ERR",
-        "INV_EEC_STATE_ERR",
-        "FATAL_ERR",
-        "RESP_TIMEOUT_ERR",
-        "GENERAL_ERR"
-    };
-
-    if (status < IBV_WC_SUCCESS || status > IBV_WC_GENERAL_ERR)
-        return "<status out of range!>";
-    return lookup[status];
-}
-
 /**
  * Synchronously transmit the packet described by 'bd' on queue pair 'qp'.
  * This function waits to the HCA to return a completion status before
@@ -1255,55 +1307,6 @@ postSendAndWait(QueuePair* qp, BufferDescriptor *bd,
         DIE("wc.status(%d:%s) != IBV_WC_SUCCESS",
             wc.status, wcStatusToString(wc.status));
     }
-}
-
-int
-reapTxBuffers()
-{
-    ibv_wc retArray[MAX_TX_QUEUE_DEPTH];
-    int n = ibv_poll_cq(commonTxCq, MAX_TX_QUEUE_DEPTH, retArray);
-
-    for (int i = 0; i < n; i++) {
-        BufferDescriptor* bd =
-            reinterpret_cast<BufferDescriptor*>(retArray[i].wr_id);
-        freeTxBuffers.push_back(bd);
-
-        if (retArray[i].status != IBV_WC_SUCCESS) {
-            LOG(ERROR, "Transmit failed for buffer %lu: %s",
-                reinterpret_cast<uint64_t>(bd),
-                wcStatusToString(retArray[i].status));
-        }
-    }
-
-    return n;
-}
-
-BufferDescriptor*
-getTransmitBuffer()
-{
-    // if we've drained our free tx buffer pool, we must wait.
-    while (freeTxBuffers.empty()) {
-        reapTxBuffers();
-
-        if (freeTxBuffers.empty()) {
-            // We are temporarily out of buffers. Time how long it takes
-            // before a transmit buffer becomes available again (a long
-            // time could indicate deadlock); in the normal case this code
-            // is not invoked.
-            uint64_t start = rdtsc();
-            while (freeTxBuffers.empty())
-                reapTxBuffers();
-            uint64_t wait = rdtsc() - start;
-            if (wait > 3lu * 5 * 1000 * 1000)  {
-                LOG(WARNING, "Long delay waiting for transmit buffers "
-                        "(%lu ticks); deadlock or target crashed?", wait);
-            }
-        }
-    }
-
-    BufferDescriptor* bd = freeTxBuffers.back();
-    freeTxBuffers.pop_back();
-    return bd;
 }
 
 bool
@@ -1427,7 +1430,8 @@ void
 handleMessage(BufferDescriptor* bd, uint32_t len)
 {
     Header& header = *reinterpret_cast<Header*>(bd->buffer);
-    //LOG(ERROR, "Handling a message of length %u!", len);
+    LOG(ERROR, "Handling a message of length %u!", len);
+    LOG(ERROR, "Message was %s!", header.message);
 }
 
 int
@@ -1513,6 +1517,20 @@ poll()
     return foundWork;
 }
 
+void registerMemory(void* base, size_t bytes)
+{
+    assert(logMemoryRegion == nullptr);
+
+    logMemoryRegion = ibv_reg_mr(pd, base, bytes,
+        IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
+    if (logMemoryRegion == NULL) {
+        DIE("ibv_reg_mr failed to register %Zd bytes at %p", bytes, base);
+    }
+    logMemoryBase = reinterpret_cast<uintptr_t>(base);
+    logMemoryBytes = bytes;
+    LOG(NOTICE, "Registered %Zd bytes at %p", bytes, base);
+}
+
 int main(int argc, char* argv[])
 {
     if (argc < 3) {
@@ -1529,6 +1547,12 @@ int main(int argc, char* argv[])
 
     setup(isServer, hostName);
 
+    // Allocate a GB and register it with the HCA.
+    LOG(INFO, "Registering log memory");
+    const size_t logSize = 1lu * 1024 * 1024 * 1024;
+    void* base = xmemalign(4096, logSize);
+    registerMemory(base, logSize);
+
     if (isServer) {
         LOG(INFO, "Running server event loop");
         while (true) {
@@ -1543,6 +1567,7 @@ int main(int argc, char* argv[])
 
         const int messages = 1000000;
         uint64_t start = rdtsc();
+#if 0
         for (int i = 0; i < messages ; ++i) {
             BufferDescriptor* bd = getTransmitBuffer();
             assert(bd->buffer);
@@ -1555,10 +1580,19 @@ int main(int argc, char* argv[])
             bd->messageBytes = sizeof(*header) + 6;
             memcpy(bd->buffer + sizeof(*header), "hello", 6);
 
-            //LOG(INFO, "Client posting message");
+            LOG(INFO, "Client posting message");
 
-            postSend(qp, bd, bd->messageBytes);
+            postSendAndWait(qp, bd, bd->messageBytes);
         }
+#else
+        Chunk chunks[2];
+        chunks[0].p = (void*)logMemoryBase;
+        chunks[0].len = 10;
+        chunks[1].p = (void*)(logMemoryBase + 10);
+        chunks[1].len = 20;
+
+        sendZeroCopy(0x1282, chunks, 2, 30, qp);
+#endif
         uint64_t stop = rdtsc();
 
         printf("Took %lu cycles per req\n", (stop - start) / messages);
