@@ -835,18 +835,32 @@ void
 pollSocket()
 {
     LOG(NOTICE, "Polling for socket events");
+
+    while (true) {
+        handleFileEvent();
+        sleep(1);
+    }
+    /*
     fd_set rfds;
 
     FD_ZERO(&rfds);
     FD_SET(serverSetupSocket, &rfds);
 
-    int r = select(1, &rfds, NULL, NULL, NULL);
-    if (r == -1) {
-        DIE("Error on select");
-    } else {
-        LOG(NOTICE, "Handling a socket event");
-        handleFileEvent();
+    timeval tv{};
+
+    while (true) {
+        tv.tv_sec = 1;
+        int r = select(1, &rfds, NULL, NULL, &tv);
+        if (r == -1) {
+            DIE("Error on select");
+        } else if (r > 0) {
+            LOG(NOTICE, "Handling a socket event");
+            handleFileEvent();
+        } else {
+            LOG(NOTICE, "select timed out");
+        }
     }
+    */
 }
 
 bool setup(bool isServer, const char* hostName)
@@ -1342,7 +1356,7 @@ clientTryExchangeQueuePairs(struct sockaddr_in *sin,
                 incomingQpt->getNonce(), clientPort);
         }
 
-        if (rdtsc() - startTime > 3lu * 50 * 1000 * 1000)
+        if (rdtsc() - startTime > 3lu * 50 * 1000 * 1000 * 1000)
             return false;
     }
 }
@@ -1403,6 +1417,185 @@ clientTrySetupQueuePair(const char* hostName, uint16_t port)
     DIE("failed to connect to host");
 }
 
+int
+poll()
+{
+    InfRcTransport* t = transport;
+    static const int MAX_COMPLETIONS = 10;
+    ibv_wc wc[MAX_COMPLETIONS];
+    int foundWork = 0;
+
+    // First check for responses to requests that we have made.
+    if (!t->outstandingRpcs.empty()) {
+        int numResponses = t->infiniband->pollCompletionQueue(t->clientRxCq,
+                MAX_COMPLETIONS, wc);
+        for (int i = 0; i < numResponses; i++) {
+            foundWork = 1;
+            ibv_wc* response = &wc[i];
+            CycleCounter<RawMetric> receiveTicks;
+            BufferDescriptor *bd =
+                        reinterpret_cast<BufferDescriptor *>(response->wr_id);
+            if (response->byte_len < 1000)
+                prefetch(bd->buffer, response->byte_len);
+            PerfStats::threadStats.networkInputBytes += response->byte_len;
+            if (response->status != IBV_WC_SUCCESS) {
+                LOG(ERROR, "wc.status(%d:%s) != IBV_WC_SUCCESS",
+                    response->status,
+                    t->infiniband->wcStatusToString(response->status));
+                t->postSrqReceiveAndKickTransmit(t->clientSrq, bd);
+                throw TransportException(HERE, response->status);
+            }
+
+            Header& header(*reinterpret_cast<Header*>(bd->buffer));
+            foreach (ClientRpc& rpc, t->outstandingRpcs) {
+                if (rpc.nonce != header.nonce)
+                    continue;
+                t->outstandingRpcs.erase(t->outstandingRpcs.iterator_to(rpc));
+                rpc.session->sessionAlarm.rpcFinished();
+                uint32_t len = response->byte_len - sizeof32(header);
+                if (t->numUsedClientSrqBuffers >=
+                        MAX_SHARED_RX_QUEUE_DEPTH / 2) {
+                    // clientSrq is low on buffers, better return this one
+                    rpc.response->appendCopy(bd->buffer + sizeof(header), len);
+                    t->postSrqReceiveAndKickTransmit(t->clientSrq, bd);
+                } else {
+                    // rpc will hold one of clientSrq's buffers until
+                    // rpc.response is destroyed
+                    PayloadChunk::appendToBuffer(rpc.response,
+                                                 bd->buffer + sizeof(header),
+                                                 len, t, t->clientSrq, bd);
+                }
+                LOG(DEBUG, "Received %s response from %s with %u bytes",
+                        WireFormat::opcodeSymbol(rpc.request),
+                        rpc.session->getServiceLocator().c_str(),
+                        rpc.response->size());
+                rpc.state = ClientRpc::RESPONSE_RECEIVED;
+                ++metrics->transport.receive.messageCount;
+                ++metrics->transport.receive.packetCount;
+                metrics->transport.receive.iovecCount +=
+                    rpc.response->getNumberChunks();
+                metrics->transport.receive.byteCount +=
+                    rpc.response->size();
+                metrics->transport.receive.ticks += receiveTicks.stop();
+                rpc.notifier->completed();
+                t->clientRpcPool.destroy(&rpc);
+                if (t->outstandingRpcs.empty())
+                    t->clientRpcsActiveTime.destroy();
+                goto next;
+            }
+
+            // nonce doesn't match any outgoingRpcs, which means that
+            // numUsedClientsrqBuffers was not previously incremented by
+            // the start of an rpc. Thus, it is incremented here (since
+            // we're "using" it right now) right before posting it back.
+            t->numUsedClientSrqBuffers++;
+            t->postSrqReceiveAndKickTransmit(t->clientSrq, bd);
+            LOG(NOTICE, "incoming data doesn't match active RPC "
+                "(nonce 0x%016lx); perhaps RPC was cancelled?",
+                header.nonce);
+
+      next: { /* pass */ }
+        }
+    }
+
+    // Next, check for incoming RPC requests (assuming that we are a server).
+    if (t->serverSetupSocket >= 0) {
+        CycleCounter<RawMetric> receiveTicks;
+        int numRequests = t->infiniband->pollCompletionQueue(t->serverRxCq,
+                MAX_COMPLETIONS, wc);
+        if ((t->numFreeServerSrqBuffers - numRequests) == 0) {
+            // The receive buffer queue has run completely dry. This is bad
+            // for performance: if any requests arrive while the queue is empty,
+            // Infiniband imposes a long wait period (milliseconds?) before
+            // the caller retries.
+            RAMCLOUD_CLOG(WARNING, "Infiniband receive buffers ran out "
+                    "(%d new requests arrived); could cause significant "
+                    "delays", numRequests);
+        }
+        for (int i = 0; i < numRequests; i++) {
+            foundWork = 1;
+            ibv_wc* request = &wc[i];
+            ReadRequestHandle_MetricSet::Interval interval
+                (&ReadRequestHandle_MetricSet::requestToHandleRpc);
+
+            BufferDescriptor* bd =
+                reinterpret_cast<BufferDescriptor*>(request->wr_id);
+            if (request->byte_len < 1000)
+                prefetch(bd->buffer, request->byte_len);
+            PerfStats::threadStats.networkInputBytes += request->byte_len;
+
+            if (t->serverPortMap.find(request->qp_num)
+                    == t->serverPortMap.end()) {
+                LOG(ERROR, "failed to find qp_num in map");
+                goto done;
+            }
+
+            InfRcServerPort *port = t->serverPortMap[request->qp_num];
+            QueuePair *qp = port->qp;
+
+            --t->numFreeServerSrqBuffers;
+
+            if (request->status != IBV_WC_SUCCESS) {
+                LOG(ERROR, "failed to receive rpc!");
+                t->postSrqReceiveAndKickTransmit(t->serverSrq, bd);
+                goto done;
+            }
+            Header& header(*reinterpret_cast<Header*>(bd->buffer));
+            ServerRpc *r = t->serverRpcPool.construct(t, qp, header.nonce);
+
+            uint32_t len = request->byte_len - sizeof32(header);
+            // It's very important that we don't let the receive buffer
+            // queue get completely empty (if this happens, Infiniband
+            // won't retry until after a long delay), so when the queue
+            // starts running low we copy incoming packets in order to
+            // return the buffers immediately. The constant below was
+            // originally 2, but that turned out not to be sufficient.
+            // Measurements of the YCSB benchmarks in 7/2015 suggest that
+            // a value of 4 is (barely) okay, but we now use 8 to provide a
+            // larger margin of safety, even if a burst of packets arrives.
+            if (t->numFreeServerSrqBuffers < 8) {
+                r->requestPayload.appendCopy(bd->buffer + sizeof(header), len);
+                t->postSrqReceiveAndKickTransmit(t->serverSrq, bd);
+            } else {
+                // Let the request use the NIC's buffer directly in order
+                // to avoid copying; it will be returned when the request
+                // buffer is destroyed.
+                PayloadChunk::appendToBuffer(&r->requestPayload,
+                    bd->buffer + sizeof32(header),
+                    len, t, t->serverSrq, bd);
+            }
+
+            port->portAlarm.requestArrived(); // Restarts the port watchdog
+            interval.stop();
+            r->rpcServiceTime.start();
+            t->context->workerManager->handleRpc(r);
+            ++metrics->transport.receive.messageCount;
+            ++metrics->transport.receive.packetCount;
+            metrics->transport.receive.iovecCount +=
+                r->requestPayload.getNumberChunks();
+            metrics->transport.receive.byteCount +=
+                r->requestPayload.size();
+            metrics->transport.receive.ticks += receiveTicks.stop();
+        }
+    }
+
+  done:
+    // Retrieve transmission buffers from the NIC once they have been
+    // sent. It's done here in the hopes that it will happen when we
+    // have nothing else to do, so it's effectively free.  It's much
+    // more efficient if we can reclaim several buffers at once, so wait
+    // until buffers are running low before trying to reclaim.  This
+    // optimization improves the throughput of "clusterperf readThroughput"
+    // by about 5% (as of 7/2015).
+    if (t->freeTxBuffers.size() < 3) {
+        t->reapTxBuffers();
+        if (t->freeTxBuffers.size() >= 3) {
+            foundWork = 1;
+        }
+    }
+    return foundWork;
+}
+
 int main(int argc, char* argv[])
 {
     if (argc < 3) {
@@ -1437,6 +1630,8 @@ int main(int argc, char* argv[])
         
         bd->messageBytes = 6;
         memcpy(bd->buffer, "hello", 6);
+
+        LOG(INFO, "Client posting message");
 
         postSend(qp, bd, 6);
     }
