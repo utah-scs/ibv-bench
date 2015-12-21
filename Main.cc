@@ -1427,7 +1427,7 @@ void
 handleMessage(BufferDescriptor* bd, uint32_t len)
 {
     Header& header = *reinterpret_cast<Header*>(bd->buffer);
-    LOG(ERROR, "Handling a message of length %u!", len);
+    //LOG(ERROR, "Handling a message of length %u!", len);
 }
 
 int
@@ -1465,6 +1465,8 @@ poll()
                 postSrqReceiveAndKickTransmit(serverSrq, bd);
                 goto done;
             }
+
+            postSrqReceiveAndKickTransmit(serverSrq, bd);
             /*
             // It's very important that we don't let the receive buffer
             // queue get completely empty (if this happens, Infiniband
@@ -1539,20 +1541,27 @@ int main(int argc, char* argv[])
 
         LOG(INFO, "Client established qp");
 
-        BufferDescriptor* bd = getTransmitBuffer();
-        assert(bd->buffer);
-        assert(bd->bytes);
-        assert(bd->mr);
+        const int messages = 1000000;
+        uint64_t start = rdtsc();
+        for (int i = 0; i < messages ; ++i) {
+            BufferDescriptor* bd = getTransmitBuffer();
+            assert(bd->buffer);
+            assert(bd->bytes);
+            assert(bd->mr);
 
-        Header* header = reinterpret_cast<Header*>(bd->buffer);
-        header->len = 6;
-        
-        bd->messageBytes = sizeof(*header) + 6;
-        memcpy(bd->buffer + sizeof(*header), "hello", 6);
+            Header* header = reinterpret_cast<Header*>(bd->buffer);
+            header->len = 6;
 
-        LOG(INFO, "Client posting message");
+            bd->messageBytes = sizeof(*header) + 6;
+            memcpy(bd->buffer + sizeof(*header), "hello", 6);
 
-        postSend(qp, bd, bd->messageBytes);
+            //LOG(INFO, "Client posting message");
+
+            postSend(qp, bd, bd->messageBytes);
+        }
+        uint64_t stop = rdtsc();
+
+        printf("Took %lu cycles per req\n", (stop - start) / messages);
     }
 
     return 0;
