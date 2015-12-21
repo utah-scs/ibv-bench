@@ -1417,92 +1417,30 @@ clientTrySetupQueuePair(const char* hostName, uint16_t port)
     DIE("failed to connect to host");
 }
 
+struct Header
+{
+    uint32_t len;
+    char message[0];
+};
+
+void
+handleMessage(BufferDescriptor* bd, uint32_t len)
+{
+    Header& header = *reinterpret_cast<Header*>(bd->buffer);
+    LOG(ERROR, "Handling a message of length %u!", len);
+}
+
 int
 poll()
 {
-    InfRcTransport* t = transport;
     static const int MAX_COMPLETIONS = 10;
     ibv_wc wc[MAX_COMPLETIONS];
     int foundWork = 0;
 
-    // First check for responses to requests that we have made.
-    if (!t->outstandingRpcs.empty()) {
-        int numResponses = t->infiniband->pollCompletionQueue(t->clientRxCq,
-                MAX_COMPLETIONS, wc);
-        for (int i = 0; i < numResponses; i++) {
-            foundWork = 1;
-            ibv_wc* response = &wc[i];
-            CycleCounter<RawMetric> receiveTicks;
-            BufferDescriptor *bd =
-                        reinterpret_cast<BufferDescriptor *>(response->wr_id);
-            if (response->byte_len < 1000)
-                prefetch(bd->buffer, response->byte_len);
-            PerfStats::threadStats.networkInputBytes += response->byte_len;
-            if (response->status != IBV_WC_SUCCESS) {
-                LOG(ERROR, "wc.status(%d:%s) != IBV_WC_SUCCESS",
-                    response->status,
-                    t->infiniband->wcStatusToString(response->status));
-                t->postSrqReceiveAndKickTransmit(t->clientSrq, bd);
-                throw TransportException(HERE, response->status);
-            }
-
-            Header& header(*reinterpret_cast<Header*>(bd->buffer));
-            foreach (ClientRpc& rpc, t->outstandingRpcs) {
-                if (rpc.nonce != header.nonce)
-                    continue;
-                t->outstandingRpcs.erase(t->outstandingRpcs.iterator_to(rpc));
-                rpc.session->sessionAlarm.rpcFinished();
-                uint32_t len = response->byte_len - sizeof32(header);
-                if (t->numUsedClientSrqBuffers >=
-                        MAX_SHARED_RX_QUEUE_DEPTH / 2) {
-                    // clientSrq is low on buffers, better return this one
-                    rpc.response->appendCopy(bd->buffer + sizeof(header), len);
-                    t->postSrqReceiveAndKickTransmit(t->clientSrq, bd);
-                } else {
-                    // rpc will hold one of clientSrq's buffers until
-                    // rpc.response is destroyed
-                    PayloadChunk::appendToBuffer(rpc.response,
-                                                 bd->buffer + sizeof(header),
-                                                 len, t, t->clientSrq, bd);
-                }
-                LOG(DEBUG, "Received %s response from %s with %u bytes",
-                        WireFormat::opcodeSymbol(rpc.request),
-                        rpc.session->getServiceLocator().c_str(),
-                        rpc.response->size());
-                rpc.state = ClientRpc::RESPONSE_RECEIVED;
-                ++metrics->transport.receive.messageCount;
-                ++metrics->transport.receive.packetCount;
-                metrics->transport.receive.iovecCount +=
-                    rpc.response->getNumberChunks();
-                metrics->transport.receive.byteCount +=
-                    rpc.response->size();
-                metrics->transport.receive.ticks += receiveTicks.stop();
-                rpc.notifier->completed();
-                t->clientRpcPool.destroy(&rpc);
-                if (t->outstandingRpcs.empty())
-                    t->clientRpcsActiveTime.destroy();
-                goto next;
-            }
-
-            // nonce doesn't match any outgoingRpcs, which means that
-            // numUsedClientsrqBuffers was not previously incremented by
-            // the start of an rpc. Thus, it is incremented here (since
-            // we're "using" it right now) right before posting it back.
-            t->numUsedClientSrqBuffers++;
-            t->postSrqReceiveAndKickTransmit(t->clientSrq, bd);
-            LOG(NOTICE, "incoming data doesn't match active RPC "
-                "(nonce 0x%016lx); perhaps RPC was cancelled?",
-                header.nonce);
-
-      next: { /* pass */ }
-        }
-    }
-
     // Next, check for incoming RPC requests (assuming that we are a server).
-    if (t->serverSetupSocket >= 0) {
-        CycleCounter<RawMetric> receiveTicks;
-        int numRequests = t->infiniband->pollCompletionQueue(t->serverRxCq,
-                MAX_COMPLETIONS, wc);
+    if (serverSetupSocket >= 0) {
+        int numRequests = ibv_poll_cq(serverRxCq, MAX_COMPLETIONS, wc);
+        /*
         if ((t->numFreeServerSrqBuffers - numRequests) == 0) {
             // The receive buffer queue has run completely dry. This is bad
             // for performance: if any requests arrive while the queue is empty,
@@ -1512,38 +1450,22 @@ poll()
                     "(%d new requests arrived); could cause significant "
                     "delays", numRequests);
         }
+        */
         for (int i = 0; i < numRequests; i++) {
             foundWork = 1;
             ibv_wc* request = &wc[i];
-            ReadRequestHandle_MetricSet::Interval interval
-                (&ReadRequestHandle_MetricSet::requestToHandleRpc);
 
             BufferDescriptor* bd =
                 reinterpret_cast<BufferDescriptor*>(request->wr_id);
-            if (request->byte_len < 1000)
-                prefetch(bd->buffer, request->byte_len);
-            PerfStats::threadStats.networkInputBytes += request->byte_len;
-
-            if (t->serverPortMap.find(request->qp_num)
-                    == t->serverPortMap.end()) {
-                LOG(ERROR, "failed to find qp_num in map");
-                goto done;
-            }
-
-            InfRcServerPort *port = t->serverPortMap[request->qp_num];
-            QueuePair *qp = port->qp;
-
-            --t->numFreeServerSrqBuffers;
+            //if (request->byte_len < 1000)
+                //prefetch(bd->buffer, request->byte_len);
 
             if (request->status != IBV_WC_SUCCESS) {
                 LOG(ERROR, "failed to receive rpc!");
-                t->postSrqReceiveAndKickTransmit(t->serverSrq, bd);
+                postSrqReceiveAndKickTransmit(serverSrq, bd);
                 goto done;
             }
-            Header& header(*reinterpret_cast<Header*>(bd->buffer));
-            ServerRpc *r = t->serverRpcPool.construct(t, qp, header.nonce);
-
-            uint32_t len = request->byte_len - sizeof32(header);
+            /*
             // It's very important that we don't let the receive buffer
             // queue get completely empty (if this happens, Infiniband
             // won't retry until after a long delay), so when the queue
@@ -1564,18 +1486,11 @@ poll()
                     bd->buffer + sizeof32(header),
                     len, t, t->serverSrq, bd);
             }
+            */
 
-            port->portAlarm.requestArrived(); // Restarts the port watchdog
-            interval.stop();
-            r->rpcServiceTime.start();
-            t->context->workerManager->handleRpc(r);
-            ++metrics->transport.receive.messageCount;
-            ++metrics->transport.receive.packetCount;
-            metrics->transport.receive.iovecCount +=
-                r->requestPayload.getNumberChunks();
-            metrics->transport.receive.byteCount +=
-                r->requestPayload.size();
-            metrics->transport.receive.ticks += receiveTicks.stop();
+            //port->portAlarm.requestArrived(); // Restarts the port watchdog
+            //r->rpcServiceTime.start();
+            handleMessage(bd, request->byte_len);
         }
     }
 
@@ -1587,9 +1502,9 @@ poll()
     // until buffers are running low before trying to reclaim.  This
     // optimization improves the throughput of "clusterperf readThroughput"
     // by about 5% (as of 7/2015).
-    if (t->freeTxBuffers.size() < 3) {
-        t->reapTxBuffers();
-        if (t->freeTxBuffers.size() >= 3) {
+    if (freeTxBuffers.size() < 3) {
+        reapTxBuffers();
+        if (freeTxBuffers.size() >= 3) {
             foundWork = 1;
         }
     }
@@ -1615,6 +1530,7 @@ int main(int argc, char* argv[])
     if (isServer) {
         LOG(INFO, "Running server event loop");
         while (true) {
+            poll();
         }
     } else {
         LOG(INFO, "Client running stuff");
@@ -1627,13 +1543,16 @@ int main(int argc, char* argv[])
         assert(bd->buffer);
         assert(bd->bytes);
         assert(bd->mr);
+
+        Header* header = reinterpret_cast<Header*>(bd->buffer);
+        header->len = 6;
         
-        bd->messageBytes = 6;
-        memcpy(bd->buffer, "hello", 6);
+        bd->messageBytes = sizeof(*header) + 6;
+        memcpy(bd->buffer + sizeof(*header), "hello", 6);
 
         LOG(INFO, "Client posting message");
 
-        postSend(qp, bd, 6);
+        postSend(qp, bd, bd->messageBytes);
     }
 
     return 0;
