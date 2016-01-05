@@ -21,6 +21,7 @@
 #include "Common.h"
 #include "Tub.h"
 #include "IpAddress.h"
+#include "LargeBlockOfMemory.h"
 
 static const int PORT = 12240;
 
@@ -34,9 +35,13 @@ static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 32;
 // which results in a higher number of on-controller cache misses.
 static const uint32_t MAX_SHARED_RX_SGE_COUNT = 1;
 static const uint32_t MAX_TX_QUEUE_DEPTH = 16;
+
 // With 64 KB seglets 1 MB is fractured into 16 or 17 pieces, plus we
 // need an entry for the headers.
-enum { MAX_TX_SGE_COUNT = 24 };
+// 31 seems to be the limit on this. Not sure why, because the qp's are
+// initialized with a max sge limit of 1 anyway.
+enum { MAX_TX_SGE_COUNT = 26 };
+const uint32_t MIN_CHUNK_ZERO_COPY_LEN = 0;
 
 static const uint32_t QP_EXCHANGE_MAX_TIMEOUTS = 10;
 
@@ -90,6 +95,27 @@ std::vector<BufferDescriptor*> freeTxBuffers{};
 uintptr_t logMemoryBase = 0;
 size_t logMemoryBytes = 0;
 ibv_mr* logMemoryRegion;
+
+/**
+ * Pin all current and future memory pages in memory so that the OS does not
+ * swap them to disk. All RAMCloud server main files should call this.
+ *
+ * Note that future mapping operations (e.g. mmap, stack expansion, etc)
+ * may fail if their memory cannot be pinned due to resource limits. Thus the
+ * check below may not capture all possible failures up front. It's probably
+ * best to call this at the end of initialisation (after most large allocations
+ * have been made). This is also a good idea because pinning slows down mmap
+ * probing in #LargeBlockOfMemory.
+ */
+void pinAllMemory() {
+    int r = mlockall(MCL_CURRENT | MCL_FUTURE);
+    if (r != 0) {
+        LOG(WARNING, "Could not lock all memory pages (%s), so the OS might "
+                     "swap memory later. Check your user's \"ulimit -l\" and "
+                     "adjust /etc/security/limits.conf as necessary.",
+                     strerror(errno));
+    }
+}
 
 // XXX Lobotomized for now.
 class Address {
@@ -948,11 +974,11 @@ bool setup(bool isServer, const char* hostName)
     // least one buffer to every single queue pair (we may have thousands of
     // them with megabyte buffers).
     serverSrq = createSharedReceiveQueue(MAX_SHARED_RX_QUEUE_DEPTH,
-                                                     MAX_SHARED_RX_SGE_COUNT);
+                                         MAX_SHARED_RX_SGE_COUNT);
     check_error_null(serverSrq,
                      "failed to create server shared receive queue");
     clientSrq = createSharedReceiveQueue(MAX_SHARED_RX_QUEUE_DEPTH,
-                                                     MAX_SHARED_RX_SGE_COUNT);
+                                         MAX_SHARED_RX_SGE_COUNT);
     check_error_null(clientSrq,
                      "failed to create client shared receive queue");
 
@@ -1087,8 +1113,11 @@ struct Chunk {
     uint32_t len;
 };
 
+int chunksTransmitted = 0;
+int chunksTransmittedZeroCopy = 0;
+
 void
-sendZeroCopy(uint64_t nonce, Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp)
+sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp)
 {
     const bool allowZeroCopy = true;
     uint32_t lastChunkIndex = chunkCount - 1;
@@ -1099,10 +1128,6 @@ sendZeroCopy(uint64_t nonce, Chunk* message, uint32_t chunkCount, uint32_t messa
     BufferDescriptor* bd = getTransmitBuffer();
     bd->messageBytes = messageLen;
 
-    bool printStats = messageLen > 1024 * 1024;
-    if (printStats)
-        LOG(ERROR, "Transmitting large message size %u", messageLen);
-
     // The variables below allow us to collect several chunks from the
     // Buffer into a single sge in some situations. They describe a
     // range of bytes in bd that have not yet been put in an sge, but
@@ -1110,21 +1135,12 @@ sendZeroCopy(uint64_t nonce, Chunk* message, uint32_t chunkCount, uint32_t messa
     char* unaddedStart = bd->buffer;
     char* unaddedEnd = bd->buffer;
 
-    *(reinterpret_cast<uint64_t*>(unaddedStart)) = nonce;
-    unaddedEnd += sizeof(nonce);
-
-    int chunksToZeroCopy = 0;
     int chunksZeroCopied = 0;
 
     for (uint32_t i = 0 ; i < chunkCount; ++i) {
         Chunk& chunk = message[i];
 
         const uintptr_t addr = reinterpret_cast<const uintptr_t>(chunk.p);
-        if (addr >= logMemoryBase &&
-            (addr + chunk.len) <= (logMemoryBase + logMemoryBytes))
-        {
-            ++chunksToZeroCopy;
-        }
         // See if we can transmit this chunk from its current location
         // (zero copy) vs. copying it into a transmit buffer:
         // * The chunk must lie in the range of registered memory that
@@ -1144,7 +1160,7 @@ sendZeroCopy(uint64_t nonce, Chunk* message, uint32_t chunkCount, uint32_t messa
              chunksUsed == lastChunkIndex) &&
             addr >= logMemoryBase &&
             (addr + chunk.len) <= (logMemoryBase + logMemoryBytes) &&
-            chunk.len > 500)
+            chunk.len > MIN_CHUNK_ZERO_COPY_LEN)
         {
             if (unaddedStart != unaddedEnd) {
                 isge[sgesUsed] = {
@@ -1195,17 +1211,8 @@ sendZeroCopy(uint64_t nonce, Chunk* message, uint32_t chunkCount, uint32_t messa
     if (messageLen <= MAX_INLINE_DATA)
         txWorkRequest.send_flags |= IBV_SEND_INLINE;
 
-    if (printStats) {
-        LOG(ERROR, "Transmitting large message\n"
-                "size %u\n"
-                "Zero-copyable regions: %d\n"
-                "Zero-copied regions: %d\n\n"
-                "SGEs used: %u"
-                , messageLen
-                , chunksToZeroCopy
-                , chunksZeroCopied
-                , chunksUsed);
-    }
+    chunksTransmitted += chunksUsed;
+    chunksTransmittedZeroCopy += chunksZeroCopied;
 
     ibv_send_wr* badTxWorkRequest;
     if (ibv_post_send(qp->qp, &txWorkRequest, &badTxWorkRequest)) {
@@ -1430,8 +1437,8 @@ void
 handleMessage(BufferDescriptor* bd, uint32_t len)
 {
     Header& header = *reinterpret_cast<Header*>(bd->buffer);
-    LOG(ERROR, "Handling a message of length %u!", len);
-    LOG(ERROR, "Message was %s!", header.message);
+    //LOG(ERROR, "Handling a message of length %u!", len);
+    //LOG(ERROR, "Message was %s!", header.message);
 }
 
 int
@@ -1549,9 +1556,11 @@ int main(int argc, char* argv[])
 
     // Allocate a GB and register it with the HCA.
     LOG(INFO, "Registering log memory");
-    const size_t logSize = 1lu * 1024 * 1024 * 1024;
-    void* base = xmemalign(4096, logSize);
-    registerMemory(base, logSize);
+    const size_t logSize = 4lu * 1024 * 1024 * 1024;
+    LargeBlockOfMemory<> largeBlockOfMemory{logSize};
+    //void* base = xmemalign(4096, logSize);
+    registerMemory(largeBlockOfMemory.get(), logSize);
+    pinAllMemory();
 
     if (isServer) {
         LOG(INFO, "Running server event loop");
@@ -1566,7 +1575,6 @@ int main(int argc, char* argv[])
         LOG(INFO, "Client established qp");
 
         const int messages = 1000000;
-        uint64_t start = rdtsc();
 #if 0
         for (int i = 0; i < messages ; ++i) {
             BufferDescriptor* bd = getTransmitBuffer();
@@ -1585,17 +1593,37 @@ int main(int argc, char* argv[])
             postSendAndWait(qp, bd, bd->messageBytes);
         }
 #else
-        Chunk chunks[2];
-        chunks[0].p = (void*)logMemoryBase;
-        chunks[0].len = 10;
-        chunks[1].p = (void*)(logMemoryBase + 10);
-        chunks[1].len = 20;
+        const size_t chunkSize = 100;
+        const size_t nChunks = 24;
+        Chunk chunks[nChunks];
+        uint32_t start;
+        for (size_t i = 0; i < nChunks; ++i) {
+            do {
+                start = generateRandom();
+            } while (start > logSize - chunkSize);
+            printf("start %u\n", start);
+            chunks[i].p = (void*)(logMemoryBase + start);
+            chunks[i].len = chunkSize;
+        }
 
-        sendZeroCopy(0x1282, chunks, 2, 30, qp);
+        uint64_t startTicks = rdtsc();
+        for (int i = 0; i < messages ; ++i) {
+            sendZeroCopy(chunks, nChunks, nChunks * chunkSize, qp);
+            if ((i % 100000) == 0) {
+                LOG(ERROR, "Chunks transmitted: %u", chunksTransmitted);
+                LOG(ERROR, "Chunks transmitted zero-copy: %u",
+                        chunksTransmittedZeroCopy);
+            }
+        }
 #endif
-        uint64_t stop = rdtsc();
+        uint64_t stopTicks = rdtsc();
 
-        printf("Took %lu cycles per req\n", (stop - start) / messages);
+        uint64_t cycles = stopTicks - startTicks;
+        printf("Took %lu cycles per req\n", cycles / messages);
+
+        double seconds = cycles / (2.4 * 1000 * 1000 * 1000);
+        printf("Rate: %f MB/s\n",
+                (double(messages * nChunks * chunkSize) / (1u << 20)) / seconds);
     }
 
     return 0;

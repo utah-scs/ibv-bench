@@ -22,4 +22,6 @@ rdtsc()
     return (((uint64_t)hi << 32) | lo);
 }
 
+uint32_t generateRandom();
+
 #endif  // COMMON_H
