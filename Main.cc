@@ -1540,14 +1540,15 @@ void registerMemory(void* base, size_t bytes)
 
 int main(int argc, char* argv[])
 {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <0|1 isServer> <serverHostName>\n",
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s <0|1 isServer> <0|1 useHugePages> <serverHostName>\n",
                 argv[0]);
         exit(-1);
     }
 
     bool isServer = atoi(argv[1]) == 1;
-    const char* hostName = argv[2];
+    bool useHugePages = atoi(argv[2]) == 1;
+    const char* hostName = argv[3];
 
     LOG(INFO, "Running as %s with %s",
             isServer ? "server" : "client", hostName);
@@ -1557,9 +1558,18 @@ int main(int argc, char* argv[])
     // Allocate a GB and register it with the HCA.
     LOG(INFO, "Registering log memory");
     const size_t logSize = 4lu * 1024 * 1024 * 1024;
-    LargeBlockOfMemory<> largeBlockOfMemory{logSize};
-    //void* base = xmemalign(4096, logSize);
-    registerMemory(largeBlockOfMemory.get(), logSize);
+    void* base = nullptr;
+
+    Tub<LargeBlockOfMemory<>> largeBlockOfMemory{};
+    if (useHugePages) {
+        largeBlockOfMemory.construct(logSize);
+        base = largeBlockOfMemory->get();
+    } else {
+        base = xmemalign(4096, logSize);
+    }
+
+    registerMemory(base, logSize);
+
     pinAllMemory();
 
     if (isServer) {
