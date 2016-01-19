@@ -96,6 +96,9 @@ uintptr_t logMemoryBase = 0;
 size_t logMemoryBytes = 0;
 ibv_mr* logMemoryRegion;
 
+uint64_t remoteLogVA = 0;
+uint32_t remoteLogRkey = 0;
+
 /**
  * Pin all current and future memory pages in memory so that the OS does not
  * swap them to disk. All RAMCloud server main files should call this.
@@ -127,18 +130,22 @@ class Address {
 
 class QueuePairTuple {
   public:
-    QueuePairTuple() : qpn(0), psn(0), lid(0), nonce(0)
+    QueuePairTuple() : logVA{}, rkey{}, qpn(0), psn(0), lid(0), nonce(0)
     {
-        static_assert(sizeof(QueuePairTuple) == 68,
+        static_assert(sizeof(QueuePairTuple) == 80,
                           "QueuePairTuple has unexpected size");
     }
-    QueuePairTuple(uint16_t lid, uint32_t qpn, uint32_t psn,
+    QueuePairTuple(uint64_t logVA, uint32_t rkey,
+                   uint16_t lid, uint32_t qpn, uint32_t psn,
                    uint64_t nonce, const char* peerName = "?unknown?")
-        : qpn(qpn), psn(psn), lid(lid), nonce(nonce)
+        : logVA{logVA}, rkey{rkey},
+          qpn(qpn), psn(psn), lid(lid), nonce(nonce)
     {
         snprintf(this->peerName, sizeof(this->peerName), "%s",
             peerName);
     }
+    uint64_t    getLogVA() const    { return logVA; }
+    uint32_t    getRkey() const     { return rkey; }
     uint16_t    getLid() const      { return lid; }
     uint32_t    getQpn() const      { return qpn; }
     uint32_t    getPsn() const      { return psn; }
@@ -146,6 +153,9 @@ class QueuePairTuple {
     const char* getPeerName() const { return peerName; }
 
   private:
+    uint64_t logVA;          // Virtual address of start of remote log.
+    uint32_t rkey;           // rkey of remote log for RDMA.
+
     uint32_t qpn;            // queue pair number
     uint32_t psn;            // initial packet sequence number
     uint16_t lid;            // infiniband address: "local id"
@@ -833,13 +843,19 @@ handleFileEvent()
             MAX_SHARED_RX_QUEUE_DEPTH);
     qp->plumb(&incomingQpt);
     qp->setPeerName(incomingQpt.getPeerName());
-    LOG(DEBUG, "New queue pair for %s:%u, nonce 0x%lx",
+    LOG(DEBUG, "New queue pair for %s:%u, nonce 0x%lx, remote log VA 0x%lx, "
+            "remote log rkey 0x%x",
             inet_ntoa(sin.sin_addr), HTONS(sin.sin_port),
-            incomingQpt.getNonce());
+            incomingQpt.getNonce(), incomingQpt.getLogVA(),
+            incomingQpt.getRkey());
+    remoteLogVA = incomingQpt.getLogVA();
+    remoteLogRkey = incomingQpt.getRkey();
 
     // now send the client back our queue pair information so they can
     // complete the initialisation.
-    QueuePairTuple outgoingQpt(uint16_t(lid),
+    QueuePairTuple outgoingQpt(uintptr_t(logMemoryRegion->addr),
+                               logMemoryRegion->rkey,
+                               uint16_t(lid),
                                qp->getLocalQpNumber(),
                                qp->getInitialPsn(), incomingQpt.getNonce());
     len = sendto(serverSetupSocket, &outgoingQpt,
@@ -1283,6 +1299,36 @@ postSend(QueuePair* qp, BufferDescriptor *bd, uint32_t length,
     }
 }
 
+void
+rdmaRead(QueuePair* qp, BufferDescriptor *bd,
+         uint64_t remoteVA, uint32_t rkey)
+{
+    ibv_sge isge = {
+        reinterpret_cast<uint64_t>(bd->buffer),
+        bd->bytes,
+        bd->mr->lkey
+    };
+    ibv_send_wr txWorkRequest;
+
+    memset(&txWorkRequest, 0, sizeof(txWorkRequest));
+    txWorkRequest.wr_id = reinterpret_cast<uint64_t>(bd);// stash descriptor ptr
+
+    txWorkRequest.next = NULL;
+    txWorkRequest.sg_list = &isge;
+    txWorkRequest.num_sge = 1;
+    txWorkRequest.opcode = IBV_WR_RDMA_READ;
+    txWorkRequest.send_flags = IBV_SEND_SIGNALED;
+
+    txWorkRequest.wr.rdma.remote_addr = remoteVA;
+    txWorkRequest.wr.rdma.rkey = rkey;
+    LOG(DEBUG, "Issuing RDMA Read of 0x%lx with rkey 0x%x", remoteVA, rkey);
+
+    ibv_send_wr *bad_txWorkRequest;
+    if (ibv_post_send(qp->qp, &txWorkRequest, &bad_txWorkRequest)) {
+        DIE("ibv_post_send failed");
+    }
+}
+
 /**
  * Synchronously transmit the packet described by 'bd' on queue pair 'qp'.
  * This function waits to the HCA to return a completion status before
@@ -1389,7 +1435,9 @@ clientTrySetupQueuePair(const char* hostName, uint16_t port)
             inet_ntoa(sin->sin_addr), clientPort, nonce);
 
     for (uint32_t i = 0; i < QP_EXCHANGE_MAX_TIMEOUTS; i++) {
-        QueuePairTuple outgoingQpt(uint16_t(lid),
+        QueuePairTuple outgoingQpt(uintptr_t(logMemoryRegion->addr),
+                                   logMemoryRegion->rkey,
+                                   uint16_t(lid),
                                    qp->getLocalQpNumber(),
                                    qp->getInitialPsn(), nonce);
         QueuePairTuple incomingQpt;
@@ -1416,6 +1464,12 @@ clientTrySetupQueuePair(const char* hostName, uint16_t port)
 
         // plumb up our queue pair with the server's parameters.
         qp->plumb(&incomingQpt);
+        LOG(DEBUG, "New queue pair nonce 0x%lx, remote log VA 0x%lx, "
+                "remote log rkey 0x%x",
+                incomingQpt.getNonce(), incomingQpt.getLogVA(),
+                incomingQpt.getRkey());
+        remoteLogVA = incomingQpt.getLogVA();
+        remoteLogRkey = incomingQpt.getRkey();
         return qp;
     }
 
@@ -1607,7 +1661,7 @@ int main(int argc, char* argv[])
 
             postSendAndWait(qp, bd, bd->messageBytes);
         }
-#else
+#elseif 0
         Chunk chunks[nChunks];
         uint32_t start;
         for (size_t i = 0; i < nChunks; ++i) {
@@ -1625,6 +1679,16 @@ int main(int argc, char* argv[])
             if ((i % 100000) == 0) {
                 LOG(ERROR, "Chunks tx zero-copy: %u / %u",
                         chunksTransmittedZeroCopy, chunksTransmitted);
+            }
+        }
+#else
+        BufferDescriptor* bd = &rxDescriptors[0];
+        uint64_t startTicks = rdtsc();
+
+        for (int i = 0; i < 3; ++i) {
+            rdmaRead(qp, bd, remoteLogVA, remoteLogRkey);
+            if ((i % 100000) == 0) {
+                LOG(ERROR, "Chunks rx zero-copy RDMA read: %u", i + 1);
             }
         }
 #endif
