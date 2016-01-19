@@ -40,7 +40,7 @@ static const uint32_t MAX_TX_QUEUE_DEPTH = 16;
 // need an entry for the headers.
 // 31 seems to be the limit on this. Not sure why, because the qp's are
 // initialized with a max sge limit of 1 anyway.
-enum { MAX_TX_SGE_COUNT = 26 };
+uint32_t MAX_TX_SGE_COUNT = 26;
 const uint32_t MIN_CHUNK_ZERO_COPY_LEN = 0;
 
 static const uint32_t QP_EXCHANGE_MAX_TIMEOUTS = 10;
@@ -1540,15 +1540,20 @@ void registerMemory(void* base, size_t bytes)
 
 int main(int argc, char* argv[])
 {
-    if (argc < 4) {
-        fprintf(stderr, "Usage: %s <0|1 isServer> <0|1 useHugePages> <serverHostName>\n",
+    if (argc < 6) {
+        fprintf(stderr, "Usage: %s <0|1 isServer> <0|1 useHugePages> <chunkSize> <chunksPerMessage> <sgLength> <serverHostName>\n",
                 argv[0]);
         exit(-1);
     }
 
     bool isServer = atoi(argv[1]) == 1;
     bool useHugePages = atoi(argv[2]) == 1;
-    const char* hostName = argv[3];
+
+    const size_t chunkSize = atoi(argv[3]);
+    const size_t nChunks = atoi(argv[4]);
+    MAX_TX_SGE_COUNT = atoi(argv[5]);
+
+    const char* hostName = argv[6];
 
     LOG(INFO, "Running as %s with %s",
             isServer ? "server" : "client", hostName);
@@ -1603,8 +1608,6 @@ int main(int argc, char* argv[])
             postSendAndWait(qp, bd, bd->messageBytes);
         }
 #else
-        const size_t chunkSize = 100;
-        const size_t nChunks = 24;
         Chunk chunks[nChunks];
         uint32_t start;
         for (size_t i = 0; i < nChunks; ++i) {
@@ -1620,9 +1623,8 @@ int main(int argc, char* argv[])
         for (int i = 0; i < messages ; ++i) {
             sendZeroCopy(chunks, nChunks, nChunks * chunkSize, qp);
             if ((i % 100000) == 0) {
-                LOG(ERROR, "Chunks transmitted: %u", chunksTransmitted);
-                LOG(ERROR, "Chunks transmitted zero-copy: %u",
-                        chunksTransmittedZeroCopy);
+                LOG(ERROR, "Chunks tx zero-copy: %u / %u",
+                        chunksTransmittedZeroCopy, chunksTransmitted);
             }
         }
 #endif
