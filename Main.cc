@@ -288,7 +288,9 @@ QueuePair::QueuePair(ibv_qp_type type,
     qpa.qp_state   = IBV_QPS_INIT;
     qpa.pkey_index = 0;
     qpa.port_num   = uint8_t(ibPhysicalPort);
-    qpa.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE;
+    qpa.qp_access_flags = IBV_ACCESS_REMOTE_WRITE |
+                          IBV_ACCESS_REMOTE_READ |
+                          IBV_ACCESS_LOCAL_WRITE;
     qpa.qkey       = QKey;
 
     int mask = IBV_QP_STATE | IBV_QP_PORT;
@@ -740,7 +742,9 @@ createBuffers(void** ppBase,
     *ppBase = xmemalign(4096, bytes);
 
     ibv_mr *mr = ibv_reg_mr(pd, *ppBase, bytes,
-        IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
+        IBV_ACCESS_REMOTE_WRITE |
+        IBV_ACCESS_REMOTE_READ |
+        IBV_ACCESS_LOCAL_WRITE);
     if (mr == NULL) {
         DIE("failed to register buffer", errno);
     }
@@ -1075,6 +1079,8 @@ wcStatusToString(int status)
     return lookup[status];
 }
 
+uint64_t txFailures = 0;
+
 int
 reapTxBuffers()
 {
@@ -1090,6 +1096,7 @@ reapTxBuffers()
             LOG(ERROR, "Transmit failed for buffer %lu: %s",
                 reinterpret_cast<uint64_t>(bd),
                 wcStatusToString(retArray[i].status));
+            ++txFailures;
         }
     }
 
@@ -1299,13 +1306,16 @@ postSend(QueuePair* qp, BufferDescriptor *bd, uint32_t length,
     }
 }
 
-void
-rdmaRead(QueuePair* qp, BufferDescriptor *bd,
+// Returns 0 on success or ENOMEM if send queue is full.
+int
+rdmaRead(QueuePair* qp, BufferDescriptor *bd, uint32_t bytes,
          uint64_t remoteVA, uint32_t rkey)
 {
+    assert(bytes <= bd->bytes);
+
     ibv_sge isge = {
         reinterpret_cast<uint64_t>(bd->buffer),
-        bd->bytes,
+        bytes,
         bd->mr->lkey
     };
     ibv_send_wr txWorkRequest;
@@ -1316,17 +1326,36 @@ rdmaRead(QueuePair* qp, BufferDescriptor *bd,
     txWorkRequest.next = NULL;
     txWorkRequest.sg_list = &isge;
     txWorkRequest.num_sge = 1;
+
+    // XXX RDMA WRITE works fine here, but RDMA READ throws errors =(
     txWorkRequest.opcode = IBV_WR_RDMA_READ;
+    //txWorkRequest.opcode = IBV_WR_RDMA_WRITE;
+
+    //txWorkRequest.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
     txWorkRequest.send_flags = IBV_SEND_SIGNALED;
+    //txWorkRequest.send_flags = 0; // This will deadlock, since we won't see CQ entries to reap buffers.
 
     txWorkRequest.wr.rdma.remote_addr = remoteVA;
     txWorkRequest.wr.rdma.rkey = rkey;
-    LOG(DEBUG, "Issuing RDMA Read of 0x%lx with rkey 0x%x", remoteVA, rkey);
+
 
     ibv_send_wr *bad_txWorkRequest;
-    if (ibv_post_send(qp->qp, &txWorkRequest, &bad_txWorkRequest)) {
-        DIE("ibv_post_send failed");
+    int r = ibv_post_send(qp->qp, &txWorkRequest, &bad_txWorkRequest);
+
+    // ENOMEM is returned when send queue is full.
+    if (r == ENOMEM)
+        return r;
+
+    if (r) {
+        LOG(ERROR, "ibv_post_send failed errno %d %s", errno, strerror(errno));
+        DIE("ibv_post_send failed for RDMA Read of 0x%lx with rkey 0x%x",
+                remoteVA, rkey);
     }
+
+    //LOG(ERROR, "Posted RDMA read of %u bytes with bd %lu (capacity %u)",
+    //        bytes, reinterpret_cast<uint64_t>(bd), bd->bytes);
+
+    return 0;
 }
 
 /**
@@ -1583,7 +1612,9 @@ void registerMemory(void* base, size_t bytes)
     assert(logMemoryRegion == nullptr);
 
     logMemoryRegion = ibv_reg_mr(pd, base, bytes,
-        IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
+        IBV_ACCESS_REMOTE_WRITE |
+        IBV_ACCESS_REMOTE_READ |
+        IBV_ACCESS_LOCAL_WRITE);
     if (logMemoryRegion == NULL) {
         DIE("ibv_reg_mr failed to register %Zd bytes at %p", bytes, base);
     }
@@ -1665,10 +1696,8 @@ int main(int argc, char* argv[])
         Chunk chunks[nChunks];
         uint32_t start;
         for (size_t i = 0; i < nChunks; ++i) {
-            do {
-                start = generateRandom();
-            } while (start > logSize - chunkSize);
-            printf("start %u\n", start);
+            start = generateRandom();
+            start = start % (logSize - chunkSize);
             chunks[i].p = (void*)(logMemoryBase + start);
             chunks[i].len = chunkSize;
         }
@@ -1682,13 +1711,20 @@ int main(int argc, char* argv[])
             }
         }
 #else
-        BufferDescriptor* bd = &rxDescriptors[0];
         uint64_t startTicks = rdtsc();
 
-        for (int i = 0; i < 3; ++i) {
-            rdmaRead(qp, bd, remoteLogVA, remoteLogRkey);
+        for (int i = 0; i < messages; ++i) {
+            //uint64_t start = generateRandom();
+            //start = start % (logSize - chunkSize);
+            BufferDescriptor* bd = getTransmitBuffer();
+
+            uint64_t start = 0;
+            while (rdmaRead(qp, bd, chunkSize,
+                            remoteLogVA + start, remoteLogRkey) == ENOMEM)
+            {
+            }
             if ((i % 100000) == 0) {
-                LOG(ERROR, "Chunks rx zero-copy RDMA read: %u", i + 1);
+                LOG(ERROR, "Chunks rx zero-copy RDMA read: %u (%lu errors)", i + 1, txFailures);
             }
         }
 #endif
