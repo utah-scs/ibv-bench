@@ -1714,11 +1714,11 @@ int main(int argc, char* argv[])
         uint64_t startTicks = rdtsc();
 
         for (int i = 0; i < messages; ++i) {
-            //uint64_t start = generateRandom();
-            //start = start % (logSize - chunkSize);
             BufferDescriptor* bd = getTransmitBuffer();
 
-            uint64_t start = 0;
+            //uint64_t start = 0;
+            uint64_t start = generateRandom();
+            start = start % (logSize - chunkSize);
             while (rdmaRead(qp, bd, chunkSize,
                             remoteLogVA + start, remoteLogRkey) == ENOMEM)
             {
