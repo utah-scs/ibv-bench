@@ -17,6 +17,10 @@
 #include <vector>
 #include <string>
 #include <thread>
+#include <iostream>
+#include <map>
+
+#include "docopt.h"
 
 #include "Common.h"
 #include "Tub.h"
@@ -1623,22 +1627,43 @@ void registerMemory(void* base, size_t bytes)
     LOG(NOTICE, "Registered %Zd bytes at %p", bytes, base);
 }
 
-int main(int argc, char* argv[])
+static const char USAGE[] =
+R"(ibv-bench.
+
+    Usage:
+      ibv-bench server <hostname> [--hugePages]
+      ibv-bench client <hostname> [--hugePages] [--chunkSize=SIZE] [--chunksPerMessage=CHUNKS] [--sgLength=SGLEN] [--mode=MODE]
+      ibv-bench (-h | --help)
+
+    Options:
+      -h --help                  Show this screen
+      --hugePages                Use huge pages
+      --chunkSize=SIZE           Size of individual objects [default: 100]
+      --chunksPerMessage=CHUNKS  Number of objects to send per send/write, ignored for read [default: 1]
+      --sgLength=SGLEN           Max S/G list length [default: 24]
+      --mode=MODE                send, read, write [default: read]
+)";
+
+int main(int argc, const char** argv)
 {
-    if (argc < 6) {
-        fprintf(stderr, "Usage: %s <0|1 isServer> <0|1 useHugePages> <chunkSize> <chunksPerMessage> <sgLength> <serverHostName>\n",
-                argv[0]);
-        exit(-1);
+    std::map<std::string, docopt::value> args
+        = docopt::docopt(USAGE,
+                         { argv + 1, argv + argc },
+                         true,               // show help if requested
+                         "ibv-bench 0.1");  // version string
+
+    // Dump command line args for debugging.
+    for(auto const& arg : args) {
+        std::cout << arg.first <<  " " << arg.second << std::endl;
     }
 
-    bool isServer = atoi(argv[1]) == 1;
-    bool useHugePages = atoi(argv[2]) == 1;
+    bool isServer = bool(args["server"]) && args["server"].asBool();
+    bool useHugePages =
+        bool(args["--hugePages"]) && args["--hugePages"].asBool();
+    const size_t chunkSize = args["--chunkSize"].asLong();
 
-    const size_t chunkSize = atoi(argv[3]);
-    const size_t nChunks = atoi(argv[4]);
-    MAX_TX_SGE_COUNT = atoi(argv[5]);
-
-    const char* hostName = argv[6];
+    size_t nChunks = args["--chunksPerMessage"].asLong();
+    const char* hostName = args["<hostname>"].asString().c_str();
 
     LOG(INFO, "Running as %s with %s",
             isServer ? "server" : "client", hostName);
@@ -1711,6 +1736,12 @@ int main(int argc, char* argv[])
             }
         }
 #else
+        // RDMA Read can only fetch 1 item per op.
+        // Doesn't matter for RDMA logic below, but final stat dump multiplies
+        // by nChunks, so this needs to be right to get correct stats out.
+        nChunks = 1;
+
+
         uint64_t startTicks = rdtsc();
 
         for (int i = 0; i < messages; ++i) {

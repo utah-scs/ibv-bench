@@ -1,7 +1,10 @@
-CXXFLAGS := -std=c++14 -O3
+CXXFLAGS := -std=c++14 -O3 -Idocopt.cpp
 
-main: Main.o IpAddress.o LargeBlockOfMemory.o Common.o
-	g++ $^ -o main -libverbs -lpthread
+ibv-bench: Main.o IpAddress.o LargeBlockOfMemory.o Common.o docopt.o
+	g++ $^ -o ibv-bench -libverbs -lpthread
+
+docopt.o: docopt.cpp/docopt.cpp
+	g++ $(CXXFLAGS) -c $<
 
 Common.o: Common.cc
 	g++ $(CXXFLAGS) -c Common.cc
@@ -18,4 +21,4 @@ Main.o: Main.cc
 
 .PHONY: clean
 clean:
-	-rm *.o main
+	-rm *.o ibv-bench
