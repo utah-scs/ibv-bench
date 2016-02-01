@@ -1,24 +1,24 @@
-CXXFLAGS := -std=c++14 -O3 -Idocopt.cpp
+CXXFLAGS := -std=c++14 -O3 -Idocopt.cpp -Wall -Werror
+LDFLAGS := -libverbs -lpthread
 
-ibv-bench: Main.o IpAddress.o LargeBlockOfMemory.o Common.o docopt.o
-	g++ $^ -o ibv-bench -libverbs -lpthread
+SRCS := $(wildcard *.cc)
+OBJS := $(patsubst %.cc, %.o, $(SRCS)) docopt.o
 
-docopt.o: docopt.cpp/docopt.cpp
-	g++ $(CXXFLAGS) -c $<
+ibv-bench: $(OBJS)
+	$(CXX) $^ -o ibv-bench $(LDFLAGS)
 
-Common.o: Common.cc
-	g++ $(CXXFLAGS) -c Common.cc
+docopt.o : docopt.cpp/docopt.cpp
+	$(CXX) $(CXXFLAGS) -Wno-unknown-pragmas -c $<
 
-IpAddress.o: IpAddress.cc
-	g++ $(CXXFLAGS) -c IpAddress.cc
+%.o : %.cpp
+	$(CXX) $(CXXFLAGS) -c $<
 
-LargeBlockOfMemory.o: LargeBlockOfMemory.cc
-	g++ $(CXXFLAGS) -c LargeBlockOfMemory.cc
-
-Main.o: Main.cc
-	g++ $(CXXFLAGS) -c Main.cc
-
+%.o : %.cc
+	$(CXX) $(CXXFLAGS) -c $<
 
 .PHONY: clean
 clean:
 	-rm *.o ibv-bench
+
+all: ibv-bench
+

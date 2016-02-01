@@ -26,6 +26,7 @@
 #include "Tub.h"
 #include "IpAddress.h"
 #include "LargeBlockOfMemory.h"
+#include "Cycles.h"
 
 static const int PORT = 12240;
 
@@ -585,7 +586,7 @@ class DeviceList {
         : devices(ibv_get_device_list(NULL))
     {
         if (devices == NULL) {
-            DIE("Could not open infiniband device list", errno);
+            DIE("Could not open infiniband device list: %d", errno);
         }
     }
 
@@ -630,7 +631,7 @@ xmemalign(size_t alignment, size_t len)
 
     r = posix_memalign(&p, alignment, len > 0 ? len : 1);
     if (r != 0) {
-        DIE("posix_memalign(%lu, %lu) failed", alignment);
+        DIE("posix_memalign(%lu, %lu) failed", alignment, len);
     }
 
     return p;
@@ -678,13 +679,13 @@ bool devSetup() {
 
     ctxt = ibv_open_device(dev);
     if (ctxt == NULL) {
-        DIE(, "failed to open infiniband device: %s",
+        DIE("failed to open infiniband device: %s",
                 name == NULL ? "any" : name);
     }
 
     pd = ibv_alloc_pd(ctxt);
     if (pd == NULL) {
-        DIE("failed to allocate infiniband protection domain", errno);
+        DIE("failed to allocate infiniband protection domain: %d", errno);
     }
 
     return true;
@@ -750,7 +751,7 @@ createBuffers(void** ppBase,
         IBV_ACCESS_REMOTE_READ |
         IBV_ACCESS_LOCAL_WRITE);
     if (mr == NULL) {
-        DIE("failed to register buffer", errno);
+        DIE("failed to register buffer: %d", errno);
     }
 
     char* buffer = static_cast<char*>(*ppBase);
@@ -1048,6 +1049,8 @@ bool setup(bool isServer, const char* hostName)
         ibv_create_cq(ctxt, MAX_TX_QUEUE_DEPTH, NULL, NULL, 0);
     check_error_null(commonTxCq,
                      "failed to create transmit completion queue");
+
+    return true;
 }
 
 const char*
@@ -1523,7 +1526,7 @@ struct Header
 void
 handleMessage(BufferDescriptor* bd, uint32_t len)
 {
-    Header& header = *reinterpret_cast<Header*>(bd->buffer);
+    //Header& header = *reinterpret_cast<Header*>(bd->buffer);
     //LOG(ERROR, "Handling a message of length %u!", len);
     //LOG(ERROR, "Message was %s!", header.message);
 }
