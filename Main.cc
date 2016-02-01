@@ -27,6 +27,7 @@
 #include "IpAddress.h"
 #include "LargeBlockOfMemory.h"
 #include "Cycles.h"
+#include "CycleCounter.h"
 
 static const int PORT = 12240;
 
@@ -1630,6 +1631,71 @@ void registerMemory(void* base, size_t bytes)
     LOG(NOTICE, "Registered %Zd bytes at %p", bytes, base);
 }
 
+QueuePair* clientQP = nullptr;
+
+enum Mode { MODE_SEND, MODE_WRITE, MODE_READ };
+
+static const int messages = 1000000;
+static const size_t logSize = 4lu * 1024 * 1024 * 1024;
+
+bool isServer = false;
+bool useHugePages = false;
+size_t chunkSize = 100;
+size_t nChunks = 24;
+
+uint64_t benchSend()
+{
+
+    Chunk chunks[nChunks];
+    uint32_t start;
+    for (size_t i = 0; i < nChunks; ++i) {
+        start = generateRandom();
+        start = start % (logSize - chunkSize);
+        chunks[i].p = (void*)(logMemoryBase + start);
+        chunks[i].len = chunkSize;
+    }
+
+    CycleCounter<> counter{};
+
+    for (int i = 0; i < messages ; ++i) {
+        sendZeroCopy(chunks, nChunks, nChunks * chunkSize, clientQP);
+        if ((i % 100000) == 0) {
+            LOG(ERROR, "Chunks tx zero-copy: %u / %u",
+                    chunksTransmittedZeroCopy, chunksTransmitted);
+        }
+    }
+
+    return counter.stop();
+}
+
+uint64_t benchRDMAWrite()
+{
+    CycleCounter<> counter{};
+    return counter.stop();
+}
+
+uint64_t benchRDMARead()
+{
+    CycleCounter<> counter{};
+
+    for (int i = 0; i < messages; ++i) {
+        BufferDescriptor* bd = getTransmitBuffer();
+
+        //uint64_t start = 0;
+        uint64_t start = generateRandom();
+        start = start % (logSize - chunkSize);
+        while (rdmaRead(clientQP, bd, chunkSize,
+                        remoteLogVA + start, remoteLogRkey) == ENOMEM)
+        {
+        }
+        if ((i % 100000) == 0) {
+            LOG(ERROR, "Chunks rx zero-copy RDMA read: %u (%lu errors)", i + 1, txFailures);
+        }
+    }
+
+    return counter.stop();
+}
+
 static const char USAGE[] =
 R"(ibv-bench.
 
@@ -1660,13 +1726,19 @@ int main(int argc, const char** argv)
         std::cout << arg.first <<  " " << arg.second << std::endl;
     }
 
-    bool isServer = bool(args["server"]) && args["server"].asBool();
-    bool useHugePages =
-        bool(args["--hugePages"]) && args["--hugePages"].asBool();
-    const size_t chunkSize = args["--chunkSize"].asLong();
+    isServer = bool(args["server"]) && args["server"].asBool();
+    useHugePages = bool(args["--hugePages"]) && args["--hugePages"].asBool();
+    chunkSize = args["--chunkSize"].asLong();
+    nChunks = args["--chunksPerMessage"].asLong();
 
-    size_t nChunks = args["--chunksPerMessage"].asLong();
     const char* hostName = args["<hostname>"].asString().c_str();
+
+    Mode mode = MODE_READ;
+    if (args["--mode"].asString() == "send") {
+        mode = MODE_SEND;
+    } else if (args["--mode"].asString() == "write") {
+        mode = MODE_WRITE;
+    }
 
     LOG(INFO, "Running as %s with %s",
             isServer ? "server" : "client", hostName);
@@ -1675,7 +1747,6 @@ int main(int argc, const char** argv)
 
     // Allocate a GB and register it with the HCA.
     LOG(INFO, "Registering log memory");
-    const size_t logSize = 4lu * 1024 * 1024 * 1024;
     void* base = nullptr;
 
     Tub<LargeBlockOfMemory<>> largeBlockOfMemory{};
@@ -1698,12 +1769,13 @@ int main(int argc, const char** argv)
     } else {
         LOG(INFO, "Client running stuff");
 
-        QueuePair* qp = clientTrySetupQueuePair(hostName, PORT);
+        clientQP = clientTrySetupQueuePair(hostName, PORT);
 
         LOG(INFO, "Client established qp");
 
-        const int messages = 1000000;
-#if 0
+        /* Some junk to do synchronous sends, non-zero-copy
+         * Probably need cleanup.
+         *
         for (int i = 0; i < messages ; ++i) {
             BufferDescriptor* bd = getTransmitBuffer();
             assert(bd->buffer);
@@ -1720,50 +1792,29 @@ int main(int argc, const char** argv)
 
             postSendAndWait(qp, bd, bd->messageBytes);
         }
-#elseif 0
-        Chunk chunks[nChunks];
-        uint32_t start;
-        for (size_t i = 0; i < nChunks; ++i) {
-            start = generateRandom();
-            start = start % (logSize - chunkSize);
-            chunks[i].p = (void*)(logMemoryBase + start);
-            chunks[i].len = chunkSize;
+        */
+
+        uint64_t cycles = 0;
+        switch (mode) {
+        case MODE_SEND:
+            cycles = benchSend();
+            break;
+
+        case MODE_WRITE:
+            cycles = benchRDMAWrite();
+            break;
+
+        case MODE_READ:
+            // RDMA Read can only fetch 1 item per op.
+            // Doesn't matter for RDMA logic below, but final stat dump multiplies
+            // by nChunks, so this needs to be right to get correct stats out.
+            nChunks = 1;
+            cycles = benchRDMARead();
+            break;
+        default:
+            DIE("Bad bench mode chosen.");
         }
 
-        uint64_t startTicks = rdtsc();
-        for (int i = 0; i < messages ; ++i) {
-            sendZeroCopy(chunks, nChunks, nChunks * chunkSize, qp);
-            if ((i % 100000) == 0) {
-                LOG(ERROR, "Chunks tx zero-copy: %u / %u",
-                        chunksTransmittedZeroCopy, chunksTransmitted);
-            }
-        }
-#else
-        // RDMA Read can only fetch 1 item per op.
-        // Doesn't matter for RDMA logic below, but final stat dump multiplies
-        // by nChunks, so this needs to be right to get correct stats out.
-        nChunks = 1;
-
-
-        uint64_t startTicks = Cycles::rdtsc();
-
-        for (int i = 0; i < messages; ++i) {
-            BufferDescriptor* bd = getTransmitBuffer();
-
-            //uint64_t start = 0;
-            uint64_t start = generateRandom();
-            start = start % (logSize - chunkSize);
-            while (rdmaRead(qp, bd, chunkSize,
-                            remoteLogVA + start, remoteLogRkey) == ENOMEM)
-            {
-            }
-            if ((i % 100000) == 0) {
-                LOG(ERROR, "Chunks rx zero-copy RDMA read: %u (%lu errors)", i + 1, txFailures);
-            }
-        }
-#endif
-        uint64_t stopTicks = Cycles::rdtsc();
-        uint64_t cycles = stopTicks - startTicks;
         double seconds = Cycles::toSeconds(cycles);
 
         printf("Rate: %0.2f MB/s\n",
