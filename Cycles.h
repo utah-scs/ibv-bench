@@ -18,8 +18,6 @@
 
 #include "Common.h"
 
-namespace RAMCloud {
-
 /**
  * This class provides static methods that read the fine-grain CPU
  * cycle counter and translate between cycle-level times and absolute
@@ -77,7 +75,5 @@ class Cycles {
         return cyclesPerSec;
     }
 };
-
-} // end RAMCloud
 
 #endif  // RAMCLOUD_CYCLES_H

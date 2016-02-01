@@ -22,8 +22,6 @@
 #include "Common.h"
 #include "Cycles.h"
 
-namespace RAMCloud {
-
 double Cycles::cyclesPerSec = 0;
 uint64_t Cycles::mockTscValue = 0;
 double Cycles::mockCyclesPerSec = 0;
@@ -239,4 +237,3 @@ Cycles::sleep(uint64_t us)
     uint64_t stop = Cycles::rdtsc() + Cycles::fromNanoseconds(1000*us);
     while (Cycles::rdtsc() < stop);
 }
-} // end RAMCloud

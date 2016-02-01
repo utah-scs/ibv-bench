@@ -1745,7 +1745,7 @@ int main(int argc, const char** argv)
         nChunks = 1;
 
 
-        uint64_t startTicks = rdtsc();
+        uint64_t startTicks = Cycles::rdtsc();
 
         for (int i = 0; i < messages; ++i) {
             BufferDescriptor* bd = getTransmitBuffer();
@@ -1762,14 +1762,14 @@ int main(int argc, const char** argv)
             }
         }
 #endif
-        uint64_t stopTicks = rdtsc();
-
+        uint64_t stopTicks = Cycles::rdtsc();
         uint64_t cycles = stopTicks - startTicks;
-        printf("Took %lu cycles per req\n", cycles / messages);
+        double seconds = Cycles::toSeconds(cycles);
 
-        double seconds = cycles / (2.4 * 1000 * 1000 * 1000);
-        printf("Rate: %f MB/s\n",
+        printf("Rate: %0.2f MB/s\n",
                 (double(messages * nChunks * chunkSize) / (1u << 20)) / seconds);
+        printf("Took %0.3f us per req\n", seconds / messages * 1e6);
+
     }
 
     return 0;
