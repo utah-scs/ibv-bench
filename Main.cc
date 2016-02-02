@@ -1373,10 +1373,60 @@ rdmaRead(QueuePair* qp, BufferDescriptor *bd, uint32_t bytes,
 }
 
 int
-rdmaWrite(QueuePair* qp, BufferDescriptor *bd, uint32_t bytes,
-         uint64_t remoteVA, uint32_t rkey)
+rdmaWrite(QueuePair* qp, Chunk* message, uint32_t chunkCount,
+         uint32_t messageLen, uint64_t remoteVA, uint32_t rkey)
 {
-    return rdma(IBV_WR_RDMA_WRITE, qp, bd, bytes, remoteVA, rkey);
+    if (chunkCount > MAX_TX_SGE_COUNT)
+        DIE("Tried to transmit too many chunks in a single message.");
+
+    ibv_sge isge[chunkCount];
+
+    for (uint32_t i = 0 ; i < chunkCount; ++i) {
+        Chunk& chunk = message[i];
+
+        const uintptr_t addr = reinterpret_cast<const uintptr_t>(chunk.p);
+        bool inBounds = addr >= logMemoryBase &&
+            (addr + chunk.len) <= (logMemoryBase + logMemoryBytes);
+        if (!inBounds)
+            DIE("Tried to transmit a chunk that wasn't in the log.");
+
+        isge[i] = {
+            addr,
+            chunk.len,
+            logMemoryRegion->lkey
+        };
+    }
+    ibv_send_wr txWorkRequest;
+
+    memset(&txWorkRequest, 0, sizeof(txWorkRequest));
+    txWorkRequest.wr_id = 0;
+    txWorkRequest.next = NULL;
+    txWorkRequest.sg_list = isge;
+    txWorkRequest.num_sge = chunkCount;
+    txWorkRequest.opcode = IBV_WR_RDMA_WRITE;
+    txWorkRequest.send_flags = IBV_SEND_SIGNALED;
+
+    txWorkRequest.wr.rdma.remote_addr = remoteVA;
+    txWorkRequest.wr.rdma.rkey = rkey;
+
+    // We can get a substantial latency improvement (nearly 2usec less per RTT)
+    // by inlining data with the WQE for small messages. The Verbs library
+    // automatically takes care of copying from the SGEs to the WQE.
+    //if (messageLen <= MAX_INLINE_DATA)
+        //txWorkRequest.send_flags |= IBV_SEND_INLINE;
+
+    chunksTransmitted += chunkCount;
+    chunksTransmittedZeroCopy += chunkCount;
+
+    ibv_send_wr* badTxWorkRequest;
+    int r = ibv_post_send(qp->qp, &txWorkRequest, &badTxWorkRequest);
+    if (r == ENOMEM)
+        return r;
+
+    if (r)
+        DIE("ibv_post_send failed: %d %s", r, strerror(r));
+
+    return 0;
 }
 
 /**
@@ -1660,7 +1710,7 @@ size_t nChunks = 24;
 uint64_t benchSend()
 {
     Chunk chunks[nChunks];
-    uint32_t start;
+    uint32_t start = 0;
     for (size_t i = 0; i < nChunks; ++i) {
         start = generateRandom();
         start = start % (logSize - chunkSize);
@@ -1683,20 +1733,26 @@ uint64_t benchSend()
 
 uint64_t benchRDMAWrite()
 {
+    Chunk chunks[nChunks];
+    uint32_t start = 0;
+    for (size_t i = 0; i < nChunks; ++i) {
+        start = generateRandom();
+        start = start % (logSize - chunkSize);
+        chunks[i].p = (void*)(logMemoryBase + start);
+        chunks[i].len = chunkSize;
+    }
+
     CycleCounter<> counter{};
 
-    for (int i = 0; i < messages; ++i) {
-        BufferDescriptor* bd = getTransmitBuffer();
-
-        //uint64_t start = 0;
-        uint64_t start = generateRandom();
-        start = start % (logSize - chunkSize);
-        while (rdmaWrite(clientQP, bd, chunkSize,
-                         remoteLogVA + start, remoteLogRkey) == ENOMEM)
+    for (int i = 0; i < messages ; ++i) {
+        while (rdmaWrite(clientQP, chunks, nChunks, nChunks * chunkSize,
+                            remoteLogVA + start, remoteLogRkey) == ENOMEM)
         {
+            reapTxBuffers();
         }
         if ((i % 100000) == 0) {
-            LOG(ERROR, "Chunks rx zero-copy RDMA write: %u (%lu errors)", i + 1, txFailures);
+            LOG(ERROR, "Chunks tx zero-copy: %u / %u",
+                    chunksTransmittedZeroCopy, chunksTransmitted);
         }
     }
 
@@ -1756,9 +1812,8 @@ void measure(uint32_t sgLen) {
         break;
 
     case MODE_WRITE:
-        if (sgLen > 1)
+        if (sgLen != nChunks)
             return;
-        nChunks = 1;
         cycles = benchRDMAWrite();
         break;
 
