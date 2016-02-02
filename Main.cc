@@ -1098,6 +1098,9 @@ reapTxBuffers()
     for (int i = 0; i < n; i++) {
         BufferDescriptor* bd =
             reinterpret_cast<BufferDescriptor*>(retArray[i].wr_id);
+        if (bd == nullptr)
+            continue;
+
         freeTxBuffers.push_back(bd);
 
         if (retArray[i].status != IBV_WC_SUCCESS) {
@@ -1696,16 +1699,16 @@ void registerMemory(void* base, size_t bytes)
 
 QueuePair* clientQP = nullptr;
 
-enum Mode { MODE_SEND, MODE_WRITE, MODE_READ };
+enum Mode { MODE_SEND, MODE_WRITE, MODE_READ, MODE_ALL };
 
 static const int messages = 10 * 1000 * 1000;
 static const size_t logSize = 4lu * 1024 * 1024 * 1024;
 
-Mode mode = MODE_READ;
+Mode mode = MODE_ALL;
 bool isServer = false;
 bool useHugePages = false;
 size_t chunkSize = 100;
-size_t nChunks = 24;
+size_t nChunks = 32;
 
 uint64_t benchSend()
 {
@@ -1781,7 +1784,16 @@ uint64_t benchRDMARead()
     return counter.stop();
 }
 
-void measure(uint32_t sgLen) {
+void dumpStats(Mode mode, uint64_t cycles, int chunksPerMessage, uint32_t sgLen)
+{
+    double seconds = Cycles::toSeconds(cycles);
+    double mbs =
+      (double(messages * chunksPerMessage * chunkSize) / (1u << 20)) / seconds;
+    double usPerMessage = seconds / messages * 1e6;
+    printf("> %d %u %0.2f %0.3f\n", mode, sgLen, mbs, usPerMessage);
+}
+
+void measure() {
     /* Some junk to do synchronous sends, non-zero-copy
      * Probably need cleanup.
      *
@@ -1803,40 +1815,40 @@ void measure(uint32_t sgLen) {
     }
     */
 
-    MAX_TX_SGE_COUNT = sgLen;
+    printf("> mode sgLen mbs usPerMessage\n");
 
     uint64_t cycles = 0;
-    switch (mode) {
-    case MODE_SEND:
-        cycles = benchSend();
-        break;
+    if (mode == MODE_SEND || mode == MODE_ALL) {
+        for (uint32_t sgLen = 1; sgLen <= 32; ++sgLen) {
+            MAX_TX_SGE_COUNT = sgLen;
+            LOG(INFO, "Running sends with sgLen %d", sgLen);
+            cycles = benchSend();
+            dumpStats(MODE_SEND, cycles, nChunks, sgLen);
+        }
+    }
 
-    case MODE_WRITE:
-        if (sgLen != nChunks)
-            return;
+    sleep(5);
+    reapTxBuffers();
+
+    if (mode == MODE_WRITE || mode == MODE_ALL) {
+        uint32_t sgLen = MAX_TX_SGE_COUNT = nChunks;
+        LOG(INFO, "Running writes with sgLen %d", sgLen);
         cycles = benchRDMAWrite();
-        break;
+        dumpStats(MODE_WRITE, cycles, nChunks, sgLen);
+    }
 
-    case MODE_READ:
-        if (sgLen > 1)
-            return;
+    sleep(5);
+    reapTxBuffers();
+
+    if (mode == MODE_READ || mode == MODE_ALL) {
+        uint32_t sgLen = MAX_TX_SGE_COUNT = 1;
+        LOG(INFO, "Running reads with sgLen %d", sgLen);
         // RDMA Read can only fetch 1 item per op.
         // Doesn't matter for RDMA logic below, but final stat dump multiplies
         // by nChunks, so this needs to be right to get correct stats out.
-        nChunks = 1;
         cycles = benchRDMARead();
-        break;
-
-    default:
-        DIE("Bad bench mode chosen.");
+        dumpStats(MODE_READ, cycles, 1, 1);
     }
-
-    double seconds = Cycles::toSeconds(cycles);
-
-    double mbs =
-        (double(messages * nChunks * chunkSize) / (1u << 20)) / seconds;
-    double usPerMessage = seconds / messages * 1e6;
-    printf("%d %u %0.2f %0.3f\n", mode, sgLen, mbs, usPerMessage);
 }
 
 static const char USAGE[] =
@@ -1851,9 +1863,9 @@ R"(ibv-bench.
       -h --help                  Show this screen
       --hugePages                Use huge pages
       --chunkSize=SIZE           Size of individual objects [default: 100]
-      --chunksPerMessage=CHUNKS  Number of objects to send per send/write, ignored for read [default: 1]
-      --sgLength=SGLEN           Max S/G list length [default: 24]
-      --mode=MODE                send, read, write [default: read]
+      --chunksPerMessage=CHUNKS  Number of objects to send per send/write, ignored for read [default: 32]
+      --sgLength=SGLEN           Max S/G list length [default: 32]
+      --mode=MODE                send, read, write, or all [default: all]
 )";
 
 int main(int argc, const char** argv)
@@ -1865,7 +1877,7 @@ int main(int argc, const char** argv)
                          "ibv-bench 0.1");  // version string
 
     // Dump command line args for debugging.
-    for(auto const& arg : args) {
+    for (auto const& arg : args) {
         std::cerr << arg.first <<  " " << arg.second << std::endl;
     }
 
@@ -1876,11 +1888,13 @@ int main(int argc, const char** argv)
 
     const char* hostName = args["<hostname>"].asString().c_str();
 
-    mode = MODE_READ;
+    mode = MODE_ALL;
     if (args["--mode"].asString() == "send") {
         mode = MODE_SEND;
     } else if (args["--mode"].asString() == "write") {
         mode = MODE_WRITE;
+    } else if (args["--mode"].asString() == "read") {
+        mode = MODE_READ;
     }
 
     LOG(INFO, "Running as %s with %s",
@@ -1916,11 +1930,7 @@ int main(int argc, const char** argv)
 
         LOG(INFO, "Client established qp");
 
-        printf("mode sgLen mbs usPerMessage\n");
-        for (uint32_t sgLen = 1; sgLen <= 24; ++sgLen) {
-            LOG(INFO, "Running with sgLen %d", sgLen);
-            measure(sgLen);
-        }
+        measure();
     }
 
     return 0;
