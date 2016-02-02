@@ -276,7 +276,7 @@ QueuePair::QueuePair(ibv_qp_type type,
     qpia.srq = srq;                    // use the same shared receive queue
     qpia.cap.max_send_wr  = maxSendWr; // max outstanding send requests
     qpia.cap.max_recv_wr  = maxRecvWr; // max outstanding recv requests
-    qpia.cap.max_send_sge = 1;         // max send scatter-gather elements
+    qpia.cap.max_send_sge = 32;         // max send scatter-gather elements
     qpia.cap.max_recv_sge = 1;         // max recv scatter-gather elements
     qpia.cap.max_inline_data =         // max bytes of immediate data on send q
         MAX_INLINE_DATA;
@@ -1181,16 +1181,15 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
         //   one most likely to benefit from zero copying.
         // * For small chunks, it's cheaper to copy than to send a
         //   separate descriptor to the NIC.
-        if (allowZeroCopy &&
-            // The "4" below means this: can't do zero-copy for this chunk
-            // unless there are at least 4 sges left (1 for unadded data, one
-            // for this zero-copy chunk, 1 for more unadded data up to the
-            // last chunk, and one for a final zero-copy chunk), or this is
-            // the last chunk (in which there better be at least 2 sge's left).
-            (sgesUsed <= MAX_TX_SGE_COUNT - 4 ||
-             chunksUsed == lastChunkIndex) &&
-            addr >= logMemoryBase &&
-            (addr + chunk.len) <= (logMemoryBase + logMemoryBytes) &&
+        //
+        //   stutsman: hold back one SGE for any data copied to the tx buffer,
+        //   *unless* this is the last chunk *and* the tx buffer is empty.
+        bool inBounds = addr >= logMemoryBase &&
+            (addr + chunk.len) <= (logMemoryBase + logMemoryBytes);
+        bool stillRoom = (sgesUsed < MAX_TX_SGE_COUNT - 1 ||
+                          ((chunksUsed == lastChunkIndex) &&
+                           (unaddedStart == unaddedEnd)));
+        if (allowZeroCopy && stillRoom && inBounds &&
             chunk.len > MIN_CHUNK_ZERO_COPY_LEN)
         {
             if (unaddedStart != unaddedEnd) {
@@ -1316,8 +1315,9 @@ postSend(QueuePair* qp, BufferDescriptor *bd, uint32_t length,
 
 // Returns 0 on success or ENOMEM if send queue is full.
 int
-rdmaRead(QueuePair* qp, BufferDescriptor *bd, uint32_t bytes,
-         uint64_t remoteVA, uint32_t rkey)
+rdma(ibv_wr_opcode opcode,
+     QueuePair* qp, BufferDescriptor *bd, uint32_t bytes,
+     uint64_t remoteVA, uint32_t rkey)
 {
     assert(bytes <= bd->bytes);
 
@@ -1335,13 +1335,12 @@ rdmaRead(QueuePair* qp, BufferDescriptor *bd, uint32_t bytes,
     txWorkRequest.sg_list = &isge;
     txWorkRequest.num_sge = 1;
 
-    // XXX RDMA WRITE works fine here, but RDMA READ throws errors =(
-    txWorkRequest.opcode = IBV_WR_RDMA_READ;
-    //txWorkRequest.opcode = IBV_WR_RDMA_WRITE;
+    txWorkRequest.opcode = opcode;
 
     //txWorkRequest.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
     txWorkRequest.send_flags = IBV_SEND_SIGNALED;
-    //txWorkRequest.send_flags = 0; // This will deadlock, since we won't see CQ entries to reap buffers.
+    // This will deadlock, since we won't see CQ entries to reap buffers.
+    //txWorkRequest.send_flags = 0;
 
     txWorkRequest.wr.rdma.remote_addr = remoteVA;
     txWorkRequest.wr.rdma.rkey = rkey;
@@ -1364,6 +1363,20 @@ rdmaRead(QueuePair* qp, BufferDescriptor *bd, uint32_t bytes,
     //        bytes, reinterpret_cast<uint64_t>(bd), bd->bytes);
 
     return 0;
+}
+
+int
+rdmaRead(QueuePair* qp, BufferDescriptor *bd, uint32_t bytes,
+         uint64_t remoteVA, uint32_t rkey)
+{
+    return rdma(IBV_WR_RDMA_READ, qp, bd, bytes, remoteVA, rkey);
+}
+
+int
+rdmaWrite(QueuePair* qp, BufferDescriptor *bd, uint32_t bytes,
+         uint64_t remoteVA, uint32_t rkey)
+{
+    return rdma(IBV_WR_RDMA_WRITE, qp, bd, bytes, remoteVA, rkey);
 }
 
 /**
@@ -1635,9 +1648,10 @@ QueuePair* clientQP = nullptr;
 
 enum Mode { MODE_SEND, MODE_WRITE, MODE_READ };
 
-static const int messages = 1000000;
+static const int messages = 10 * 1000 * 1000;
 static const size_t logSize = 4lu * 1024 * 1024 * 1024;
 
+Mode mode = MODE_READ;
 bool isServer = false;
 bool useHugePages = false;
 size_t chunkSize = 100;
@@ -1645,7 +1659,6 @@ size_t nChunks = 24;
 
 uint64_t benchSend()
 {
-
     Chunk chunks[nChunks];
     uint32_t start;
     for (size_t i = 0; i < nChunks; ++i) {
@@ -1671,6 +1684,22 @@ uint64_t benchSend()
 uint64_t benchRDMAWrite()
 {
     CycleCounter<> counter{};
+
+    for (int i = 0; i < messages; ++i) {
+        BufferDescriptor* bd = getTransmitBuffer();
+
+        //uint64_t start = 0;
+        uint64_t start = generateRandom();
+        start = start % (logSize - chunkSize);
+        while (rdmaWrite(clientQP, bd, chunkSize,
+                         remoteLogVA + start, remoteLogRkey) == ENOMEM)
+        {
+        }
+        if ((i % 100000) == 0) {
+            LOG(ERROR, "Chunks rx zero-copy RDMA write: %u (%lu errors)", i + 1, txFailures);
+        }
+    }
+
     return counter.stop();
 }
 
@@ -1694,6 +1723,65 @@ uint64_t benchRDMARead()
     }
 
     return counter.stop();
+}
+
+void measure(uint32_t sgLen) {
+    /* Some junk to do synchronous sends, non-zero-copy
+     * Probably need cleanup.
+     *
+    for (int i = 0; i < messages ; ++i) {
+        BufferDescriptor* bd = getTransmitBuffer();
+        assert(bd->buffer);
+        assert(bd->bytes);
+        assert(bd->mr);
+
+        Header* header = reinterpret_cast<Header*>(bd->buffer);
+        header->len = 6;
+
+        bd->messageBytes = sizeof(*header) + 6;
+        memcpy(bd->buffer + sizeof(*header), "hello", 6);
+
+        LOG(INFO, "Client posting message");
+
+        postSendAndWait(qp, bd, bd->messageBytes);
+    }
+    */
+
+    MAX_TX_SGE_COUNT = sgLen;
+
+    uint64_t cycles = 0;
+    switch (mode) {
+    case MODE_SEND:
+        cycles = benchSend();
+        break;
+
+    case MODE_WRITE:
+        if (sgLen > 1)
+            return;
+        nChunks = 1;
+        cycles = benchRDMAWrite();
+        break;
+
+    case MODE_READ:
+        if (sgLen > 1)
+            return;
+        // RDMA Read can only fetch 1 item per op.
+        // Doesn't matter for RDMA logic below, but final stat dump multiplies
+        // by nChunks, so this needs to be right to get correct stats out.
+        nChunks = 1;
+        cycles = benchRDMARead();
+        break;
+
+    default:
+        DIE("Bad bench mode chosen.");
+    }
+
+    double seconds = Cycles::toSeconds(cycles);
+
+    double mbs =
+        (double(messages * nChunks * chunkSize) / (1u << 20)) / seconds;
+    double usPerMessage = seconds / messages * 1e6;
+    printf("%d %u %0.2f %0.3f\n", mode, sgLen, mbs, usPerMessage);
 }
 
 static const char USAGE[] =
@@ -1723,7 +1811,7 @@ int main(int argc, const char** argv)
 
     // Dump command line args for debugging.
     for(auto const& arg : args) {
-        std::cout << arg.first <<  " " << arg.second << std::endl;
+        std::cerr << arg.first <<  " " << arg.second << std::endl;
     }
 
     isServer = bool(args["server"]) && args["server"].asBool();
@@ -1733,7 +1821,7 @@ int main(int argc, const char** argv)
 
     const char* hostName = args["<hostname>"].asString().c_str();
 
-    Mode mode = MODE_READ;
+    mode = MODE_READ;
     if (args["--mode"].asString() == "send") {
         mode = MODE_SEND;
     } else if (args["--mode"].asString() == "write") {
@@ -1773,54 +1861,11 @@ int main(int argc, const char** argv)
 
         LOG(INFO, "Client established qp");
 
-        /* Some junk to do synchronous sends, non-zero-copy
-         * Probably need cleanup.
-         *
-        for (int i = 0; i < messages ; ++i) {
-            BufferDescriptor* bd = getTransmitBuffer();
-            assert(bd->buffer);
-            assert(bd->bytes);
-            assert(bd->mr);
-
-            Header* header = reinterpret_cast<Header*>(bd->buffer);
-            header->len = 6;
-
-            bd->messageBytes = sizeof(*header) + 6;
-            memcpy(bd->buffer + sizeof(*header), "hello", 6);
-
-            LOG(INFO, "Client posting message");
-
-            postSendAndWait(qp, bd, bd->messageBytes);
+        printf("mode sgLen mbs usPerMessage\n");
+        for (uint32_t sgLen = 1; sgLen <= 24; ++sgLen) {
+            LOG(INFO, "Running with sgLen %d", sgLen);
+            measure(sgLen);
         }
-        */
-
-        uint64_t cycles = 0;
-        switch (mode) {
-        case MODE_SEND:
-            cycles = benchSend();
-            break;
-
-        case MODE_WRITE:
-            cycles = benchRDMAWrite();
-            break;
-
-        case MODE_READ:
-            // RDMA Read can only fetch 1 item per op.
-            // Doesn't matter for RDMA logic below, but final stat dump multiplies
-            // by nChunks, so this needs to be right to get correct stats out.
-            nChunks = 1;
-            cycles = benchRDMARead();
-            break;
-        default:
-            DIE("Bad bench mode chosen.");
-        }
-
-        double seconds = Cycles::toSeconds(cycles);
-
-        printf("Rate: %0.2f MB/s\n",
-                (double(messages * nChunks * chunkSize) / (1u << 20)) / seconds);
-        printf("Took %0.3f us per req\n", seconds / messages * 1e6);
-
     }
 
     return 0;
