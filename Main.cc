@@ -1376,6 +1376,72 @@ rdmaRead(QueuePair* qp, BufferDescriptor *bd, uint32_t bytes,
 }
 
 int
+rdmaRead2(QueuePair* qp, BufferDescriptor* bd, uint32_t bytesPerVA,
+          uint64_t* remoteVAs, uint32_t remoteVACount, uint32_t rkey)
+{
+    assert(bytesPerVA * remoteVACount <= bd->bytes);
+
+    ibv_send_wr txWorkRequests[remoteVACount];
+    ibv_sge isge[remoteVACount];
+
+    for (uint32_t i = 0 ; i < remoteVACount; ++i) {
+        LOG(INFO, "%d bytesPerVA %u remoteVA %lu %u", i, bytesPerVA, remoteVAs[i], rkey);
+        isge[i] = {
+            reinterpret_cast<uint64_t>(bd->buffer) + (bytesPerVA * i),
+            bytesPerVA,
+            bd->mr->lkey
+        };
+        ibv_send_wr& txWorkRequest = txWorkRequests[i];
+
+        memset(&txWorkRequest, 0, sizeof(txWorkRequest));
+        txWorkRequest.wr_id = reinterpret_cast<uint64_t>(bd);// stash descriptor ptr
+        txWorkRequest.next = i == remoteVACount ? NULL : &txWorkRequests[i + 1];
+        txWorkRequest.sg_list = &isge[i];
+        txWorkRequest.num_sge = 1;
+        txWorkRequest.opcode = IBV_WR_RDMA_READ;
+        txWorkRequest.send_flags = IBV_SEND_SIGNALED;
+
+        txWorkRequest.wr.rdma.remote_addr = remoteVAs[i];
+        txWorkRequest.wr.rdma.rkey = rkey;
+    }
+
+    for (uint32_t i = 0 ; i < remoteVACount; ++i) {
+        ibv_send_wr& wr = txWorkRequests[i];
+        LOG(INFO,
+            "wr[%d]:\n"
+            "wr_id: %lu\n"
+            "next: %p\n"
+            "sg_list: %p\n"
+            "num_sge: %u\n"
+            "opcode: %d\n"
+            "send_flags: %d\n"
+            "remote_addr: %lu\n"
+            "rkey: %u\n",
+            i, wr.wr_id, wr.next, wr.sg_list, wr.num_sge, wr.opcode,
+            wr.send_flags, wr.wr.rdma.remote_addr, wr.wr.rdma.rkey);
+
+    }
+
+    ibv_send_wr *bad_txWorkRequest;
+    int r = ibv_post_send(qp->qp, &txWorkRequests[0], &bad_txWorkRequest);
+
+    // ENOMEM is returned when send queue is full.
+    if (r == ENOMEM)
+        return r;
+
+    if (r) {
+        LOG(ERROR, "ibv_post_send failed errno %d %s", errno, strerror(errno));
+        DIE("ibv_post_send failed for RDMA Read of 0x%lx with rkey 0x%x",
+                remoteVAs[0], rkey);
+    }
+
+    //LOG(ERROR, "Posted RDMA read of %u bytes with bd %lu (capacity %u)",
+    //        bytes, reinterpret_cast<uint64_t>(bd), bd->bytes);
+
+    return 0;
+}
+
+int
 rdmaWrite(QueuePair* qp, Chunk* message, uint32_t chunkCount,
          uint32_t messageLen, uint64_t remoteVA, uint32_t rkey)
 {
@@ -1770,10 +1836,18 @@ uint64_t benchRDMARead()
         BufferDescriptor* bd = getTransmitBuffer();
 
         //uint64_t start = 0;
-        uint64_t start = generateRandom();
-        start = start % (logSize - chunkSize);
-        while (rdmaRead(clientQP, bd, chunkSize,
-                        remoteLogVA + start, remoteLogRkey) == ENOMEM)
+
+        uint64_t remoteVAs[32];
+        for (int i = 0; i < 32; ++i) {
+            uint64_t start = generateRandom();
+            start = start % (logSize - chunkSize);
+            remoteVAs[i] = remoteLogVA + start;
+        }
+
+        while (rdmaRead2(clientQP, bd, chunkSize,
+                        &remoteVAs[0], 32, remoteLogRkey) == ENOMEM)
+        //while (rdmaRead(clientQP, bd, chunkSize,
+        //                remoteLogVA + start, remoteLogRkey) == ENOMEM)
         {
         }
         if ((i % 100000) == 0) {
