@@ -14,8 +14,6 @@
 #include <netdb.h>
 #include <sys/socket.h>
 
-#include <vector>
-#include <string>
 #include <thread>
 #include <iostream>
 #include <map>
@@ -97,6 +95,8 @@ void* txBase;
 BufferDescriptor txDescriptors[MAX_TX_QUEUE_DEPTH];
 
 std::vector<BufferDescriptor*> freeTxBuffers{};
+
+std::vector<QueuePair*> QueuePairs{};
 
 uintptr_t logMemoryBase = 0;
 size_t logMemoryBytes = 0;
@@ -1772,9 +1772,11 @@ static const size_t logSize = 4lu * 1024 * 1024 * 1024;
 
 Mode mode = MODE_ALL;
 bool isServer = false;
+bool isMultiClient = false;
 bool useHugePages = false;
 size_t chunkSize = 100;
 size_t nChunks = 32;
+uint8_t numClients = 1;
 
 uint64_t benchSend()
 {
@@ -1931,6 +1933,7 @@ R"(ibv-bench.
     Usage:
       ibv-bench server <hostname> [--hugePages]
       ibv-bench client <hostname> [--hugePages] [--chunkSize=SIZE] [--chunksPerMessage=CHUNKS] [--sgLength=SGLEN] [--mode=MODE]
+      ibv-bench client <hostname> --multiClient [--hugePages] [--chunkSize=SIZE] [--chunksPerMessage=CHUNKS] [--sgLength=SGLEN] [--mode=MODE]
       ibv-bench (-h | --help)
 
     Options:
@@ -1940,6 +1943,7 @@ R"(ibv-bench.
       --chunksPerMessage=CHUNKS  Number of objects to send per send/write, ignored for read [default: 32]
       --sgLength=SGLEN           Max S/G list length [default: 32]
       --mode=MODE                send, read, write, or all [default: all]
+      --multiClient              Use multiple servers to target from this client. provide hostname separated by :
 )";
 
 int main(int argc, const char** argv)
@@ -1956,12 +1960,14 @@ int main(int argc, const char** argv)
     }
 
     isServer = bool(args["server"]) && args["server"].asBool();
+    isMultiClient = bool(args["--multiClient"]) && args["--multiClient"].asBool();
     useHugePages = bool(args["--hugePages"]) && args["--hugePages"].asBool();
     chunkSize = args["--chunkSize"].asLong();
     nChunks = args["--chunksPerMessage"].asLong();
 
     const char* hostName = args["<hostname>"].asString().c_str();
-
+    std::vector<std::string> hostNames = split(hostName,':');
+    numClients = hostNames.size();
     mode = MODE_ALL;
     if (args["--mode"].asString() == "send") {
         mode = MODE_SEND;
@@ -1973,7 +1979,7 @@ int main(int argc, const char** argv)
 
     LOG(INFO, "Running as %s with %s",
             isServer ? "server" : "client", hostName);
-
+    LOG(INFO, "Multiclient:%s",isMultiClient?"True":"False");
     setup(isServer, hostName);
 
     // Allocate a GB and register it with the HCA.
@@ -1998,6 +2004,14 @@ int main(int argc, const char** argv)
             poll();
         }
     } else {
+        if(isMultiClient){
+            for (auto const&host : hostNames){
+                std::cerr<<"host "<<host<<std::endl;
+            }
+            printf("\nReached in multiclient if");
+            numClients = hostNames.size();
+            LOG(INFO, "Number of clients:%u",numClients);
+        }
         LOG(INFO, "Client running stuff");
 
         clientQP = clientTrySetupQueuePair(hostName, PORT);

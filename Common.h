@@ -1,4 +1,7 @@
 #include <cinttypes>
+#include <vector>
+#include <string>
+#include <sstream>
 
 #ifndef COMMON_H
 #define COMMON_H
@@ -23,5 +26,7 @@ rdtsc()
 }
 
 uint32_t generateRandom();
+std::vector<std::string> split(std::string str, char delimiter);
+
 
 #endif  // COMMON_H
