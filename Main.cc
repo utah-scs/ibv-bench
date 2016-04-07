@@ -1660,10 +1660,8 @@ bool
 multiClientTryExchangeQueuePairs(struct sockaddr_in *sin,
                             QueuePairTuple *outgoingQpt, QueuePairTuple *incomingQpt, uint32_t index)
 {
-    LOG(INFO,"multiClientTryExchangeQueuePairs working on host:%d, clientsocket:%d",index,clientSetupSocket[index]);
     bool haveSent = false;
     uint64_t startTime = rdtsc();
-    LOG(INFO, "outgoing nonce:0x%016lx incoming nonce:0x%016lx",outgoingQpt->getNonce(),incomingQpt->getNonce());
     while (1) {
         if (!haveSent) {
             ssize_t len = sendto(clientSetupSocket[index], outgoingQpt,
@@ -1679,7 +1677,6 @@ multiClientTryExchangeQueuePairs(struct sockaddr_in *sin,
                             "sending to ip: [%s] port: [%d]", len,
                     inet_ntoa(sin->sin_addr), NTOHS(sin->sin_port));
             } else {
-                LOG(INFO, "send done. outgoing nonce:0x%016lx incoming nonce:0x%016lx",outgoingQpt->getNonce(),incomingQpt->getNonce());
                 haveSent = true;
             }
         }
@@ -1841,8 +1838,7 @@ void
 multiClientTrySetupQueuePair(uint16_t start_port)
 {
     for (uint16_t host=0;host <numClients;host++) {
-        LOG(INFO, "multiClientTrySetupQueuePair working on server:%d clientport:%d",host,clientPort[host]);
-        IpAddress address{hostNames[host].c_str(), static_cast<uint16_t>(start_port+host)};
+        IpAddress address{hostNames[host].c_str(), static_cast<uint16_t>(start_port)};
         sockaddr_in *sin = reinterpret_cast<sockaddr_in *>(&address.address);
 
         // Create a new QueuePair and send its parameters to the server so it
