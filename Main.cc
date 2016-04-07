@@ -15,17 +15,17 @@
 #include <sys/socket.h>
 
 #include <thread>
+#include <mutex>
 #include <iostream>
 #include <map>
 
 #include "docopt.h"
 
-#include "Common.h"
 #include "Tub.h"
 #include "IpAddress.h"
 #include "LargeBlockOfMemory.h"
-#include "Cycles.h"
 #include "CycleCounter.h"
+#include "SpinLock.h"
 
 static const int PORT = 12240;
 
@@ -70,8 +70,9 @@ int          ibPhysicalPort = 1;
 int          lid;               // local id for this HCA and physical port
 int          serverSetupSocket; // UDP socket for incoming setup requests;
                                 // -1 means we're not a server
-int*          clientSetupSocket; // UDP socket for outgoing setup requests
-int*          clientPort;        // Port number associated with
+int*         clientSetupSocket; // UDP socket for outgoing setup requests
+int*         clientPort;        // Port number associated with
+RAMCloud::SpinLock     mutex("trasmitbufferlock");
 
 ibv_context* ctxt;           // device context of the HCA to use
 ibv_pd* pd;
@@ -923,144 +924,7 @@ pollSocket()
     */
 }
 
-bool setup(bool isServer, const char* hostName)
-{
-    clientSetupSocket[0] = socket(PF_INET, SOCK_DGRAM, 0);
-    if (clientSetupSocket[0] == -1) {
-        LOG(ERROR, "failed to create client socket: %s", strerror(errno));
-        exit(-1);
-    }
-    sockaddr_in socketAddress;
-    socketAddress.sin_family = AF_INET;
-    socketAddress.sin_addr.s_addr = htonl(INADDR_ANY);
-    socketAddress.sin_port = 0;
-    if (bind(clientSetupSocket[0],
-            (sockaddr*)(&socketAddress),
-            sizeof(socketAddress)) == -1) {
-        close(clientSetupSocket[0]);
-        LOG(WARNING, "couldn't bind port for clientSetupSocket[0]: %s",
-                strerror(errno));
-        exit(-1);
-    }
-
-    if (!setNonBlocking(clientSetupSocket[0])) {
-        close(clientSetupSocket[0]);
-        exit(-1);
-    }
-
-    socklen_t socketAddressLength = sizeof(socketAddress);
-    if (getsockname(clientSetupSocket[0],
-            (sockaddr*)(&socketAddress),
-            &socketAddressLength) != 0) {
-        close(clientSetupSocket[0]);
-        LOG(ERROR, "couldn't get port for clientSetupSocket[0]: %s",
-                strerror(errno));
-        exit(-1);
-    }
-    clientPort[0] = ntohs(socketAddress.sin_port);
-
-    // If this is a server, create a server setup socket and bind it.
-    if (isServer) {
-        sockaddr address;
-        getIpAddress(hostName, PORT, &address);
-
-        serverSetupSocket = socket(PF_INET, SOCK_DGRAM, 0);
-        if (serverSetupSocket == -1) {
-            DIE("failed to create server socket: %s", strerror(errno));
-        }
-
-        if (bind(serverSetupSocket, &address, sizeof(address)))
-        {
-            close(serverSetupSocket);
-            serverSetupSocket = -1;
-            DIE("failed to bind socket for port %d: %s",
-                    PORT, strerror(errno));
-        }
-
-        if (!setNonBlocking(serverSetupSocket)) {
-            close(serverSetupSocket);
-            serverSetupSocket = -1;
-            exit(-1);
-        }
-
-        LOG(NOTICE, "InfRc listening on UDP: %s:%d", hostName, PORT);
-
-        std::thread t{pollSocket};
-        t.detach();
-    }
-
-    if (!devSetup())
-        DIE("Couldn't setup the Infiniband device");
-
-    // Step 2:
-    //  Set up the initial verbs necessities: open the device, allocate
-    //  protection domain, create shared receive queue, register buffers.
-
-    lid = getLid(ibPhysicalPort);
-
-    // create two shared receive queues. all client queue pairs use one and all
-    // server queue pairs use the other. we post receive buffer work requests
-    // to these queues only. the motiviation is to avoid having to post at
-    // least one buffer to every single queue pair (we may have thousands of
-    // them with megabyte buffers).
-    serverSrq = createSharedReceiveQueue(MAX_SHARED_RX_QUEUE_DEPTH,
-                                         MAX_SHARED_RX_SGE_COUNT);
-    check_error_null(serverSrq,
-                     "failed to create server shared receive queue");
-    clientSrq = createSharedReceiveQueue(MAX_SHARED_RX_QUEUE_DEPTH,
-                                         MAX_SHARED_RX_SGE_COUNT);
-    check_error_null(clientSrq,
-                     "failed to create client shared receive queue");
-
-    // Note: RPC performance is highly sensitive to the buffer size. For
-    // example, as of 11/2012, using buffers of (1<<23 + 200) bytes is
-    // 1.3 microseconds slower than using buffers of (1<<23 + 4096)
-    // bytes.  For now, make buffers large enough for the largest RPC,
-    // and round up to the next multiple of 4096.  This approach isn't
-    // perfect (for example buffers of 1<<23 bytes also seem to be slow)
-    // but it will work for now.
-    uint32_t bufferSize = ((1u << 23) + 4095) & ~0xfff;
-
-    createBuffers(&rxBase, rxDescriptors, bufferSize,
-                  uint32_t(MAX_SHARED_RX_QUEUE_DEPTH * 2));
-    uint32_t i = 0;
-    for (auto& bd : rxDescriptors) {
-        if (i < MAX_SHARED_RX_QUEUE_DEPTH)
-            postSrqReceiveAndKickTransmit(serverSrq, &bd);
-        else
-            postSrqReceiveAndKickTransmit(clientSrq, &bd);
-        ++i;
-    }
-    //assert(numUsedClientSrqBuffers == 0);
-
-    createBuffers(&txBase, txDescriptors,
-                  bufferSize, uint32_t(MAX_TX_QUEUE_DEPTH));
-    for (auto& bd : txDescriptors)
-        freeTxBuffers.push_back(&bd);
-
-    // create completion queues for server receive, client receive, and
-    // server/client transmit
-    serverRxCq =
-        ibv_create_cq(ctxt, MAX_SHARED_RX_QUEUE_DEPTH, NULL, NULL, 0);
-    check_error_null(serverRxCq,
-                     "failed to create server receive completion queue");
-
-    clientRxCq =
-        ibv_create_cq(ctxt, MAX_SHARED_RX_QUEUE_DEPTH, NULL, NULL, 0);
-    check_error_null(clientRxCq,
-                     "failed to create client receive completion queue");
-
-    commonTxCq =
-        ibv_create_cq(ctxt, MAX_TX_QUEUE_DEPTH, NULL, NULL, 0);
-    check_error_null(commonTxCq,
-                     "failed to create transmit completion queue");
-
-    return true;
-}
-
-
-
-bool setupMultiClient()
+bool setup(bool isServer)
 {
     for(int i=0; i < numClients;i++) {
         clientSetupSocket[i] = socket(PF_INET, SOCK_DGRAM, 0);
@@ -1096,8 +960,37 @@ bool setupMultiClient()
             exit(-1);
         }
         clientPort[i] = ntohs(socketAddress.sin_port);
-        LOG(INFO, "clientPort[%d]:%d",i,clientPort[i]);
+        LOG(INFO, "Port[%d]:%d",i,clientPort[i]);
 
+    }
+    // If this is a server, create a server setup socket and bind it.
+    if (isServer) {
+        sockaddr address;
+        getIpAddress(hostNames[0].c_str(), PORT, &address);
+
+        serverSetupSocket = socket(PF_INET, SOCK_DGRAM, 0);
+        if (serverSetupSocket == -1) {
+            DIE("failed to create server socket: %s", strerror(errno));
+        }
+
+        if (bind(serverSetupSocket, &address, sizeof(address)))
+        {
+            close(serverSetupSocket);
+            serverSetupSocket = -1;
+            DIE("failed to bind socket for port %d: %s",
+                PORT, strerror(errno));
+        }
+
+        if (!setNonBlocking(serverSetupSocket)) {
+            close(serverSetupSocket);
+            serverSetupSocket = -1;
+            exit(-1);
+        }
+
+        LOG(NOTICE, "InfRc listening on UDP: %s:%d", hostNames[0].c_str(), PORT);
+
+        std::thread t{pollSocket};
+        t.detach();
     }
     if (!devSetup())
         DIE("Couldn't setup the Infiniband device");
@@ -1243,6 +1136,7 @@ BufferDescriptor*
 getTransmitBuffer()
 {
     // if we've drained our free tx buffer pool, we must wait.
+    std::lock_guard<RAMCloud::SpinLock> lock(mutex);
     while (freeTxBuffers.empty()) {
         reapTxBuffers();
 
@@ -1276,9 +1170,8 @@ int chunksTransmitted = 0;
 int chunksTransmittedZeroCopy = 0;
 
 void
-sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp)
+sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp, bool allowZeroCopy)
 {
-    const bool allowZeroCopy = true;
     uint32_t lastChunkIndex = chunkCount - 1;
     ibv_sge isge[MAX_TX_SGE_COUNT];
 
@@ -1657,7 +1550,7 @@ postSendAndWait(QueuePair* qp, BufferDescriptor *bd,
 }
 
 bool
-multiClientTryExchangeQueuePairs(struct sockaddr_in *sin,
+clientTryExchangeQueuePairs(struct sockaddr_in *sin,
                             QueuePairTuple *outgoingQpt, QueuePairTuple *incomingQpt, uint32_t index)
 {
     bool haveSent = false;
@@ -1715,130 +1608,12 @@ multiClientTryExchangeQueuePairs(struct sockaddr_in *sin,
 
 
 
-bool
-clientTryExchangeQueuePairs(struct sockaddr_in *sin,
-    QueuePairTuple *outgoingQpt, QueuePairTuple *incomingQpt)
-{
-    bool haveSent = false;
-    uint64_t startTime = rdtsc();
-
-    while (1) {
-        if (!haveSent) {
-            ssize_t len = sendto(clientSetupSocket[0], outgoingQpt,
-                sizeof(*outgoingQpt), 0, reinterpret_cast<sockaddr *>(sin),
-                sizeof(*sin));
-            if (len == -1) {
-                if (errno != EINTR && errno != EAGAIN) {
-                    DIE("sendto returned error %d: %s",
-                        errno, strerror(errno));
-                }
-            } else if (len != sizeof(*outgoingQpt)) {
-                DIE("sendto returned bad length (%Zd) while "
-                    "sending to ip: [%s] port: [%d]", len,
-                    inet_ntoa(sin->sin_addr), NTOHS(sin->sin_port));
-            } else {
-                haveSent = true;
-            }
-        }
-
-        struct sockaddr_in recvSin;
-        socklen_t sinlen = sizeof(recvSin);
-        ssize_t len = recvfrom(clientSetupSocket[0], incomingQpt,
-            sizeof(*incomingQpt), 0,
-            reinterpret_cast<sockaddr *>(&recvSin), &sinlen);
-        if (len == -1) {
-            if (errno != EINTR && errno != EAGAIN) {
-                DIE("recvfrom returned error %d: %s",
-                    errno, strerror(errno));
-            }
-        } else if (len != sizeof(*incomingQpt)) {
-            DIE("recvfrom returned bad length (%Zd) while "
-                "receiving from ip: [%s] port: [%d]", len,
-                inet_ntoa(recvSin.sin_addr), NTOHS(recvSin.sin_port));
-        } else {
-            if (outgoingQpt->getNonce() == incomingQpt->getNonce())
-                return true;
-
-            LOG(WARNING, "bad nonce from %s (expected 0x%016lx, "
-                "got 0x%016lx, port %d); ignoring",
-                inet_ntoa(sin->sin_addr), outgoingQpt->getNonce(),
-                incomingQpt->getNonce(), clientPort[0]);
-        }
-
-        if (rdtsc() - startTime > 3lu * 50 * 1000 * 1000 * 1000)
-            return false;
-    }
-}
-
-QueuePair*
-clientTrySetupQueuePair(const char* hostName, uint16_t port)
-{
-    IpAddress address{hostName, port};
-    sockaddr_in* sin = reinterpret_cast<sockaddr_in*>(&address.address);
-
-    // Create a new QueuePair and send its parameters to the server so it
-    // can create its qp and reply with its parameters.
-    QueuePair *qp = new QueuePair(IBV_QPT_RC,
-                                  clientSrq,
-                                  commonTxCq, clientRxCq,
-                                  MAX_TX_QUEUE_DEPTH,
-                                  MAX_SHARED_RX_QUEUE_DEPTH);
-    uint64_t nonce = rand();
-    LOG(DEBUG, "starting to connect to %s via local port %d, nonce 0x%lx",
-            inet_ntoa(sin->sin_addr), clientPort[0], nonce);
-
-    for (uint32_t i = 0; i < QP_EXCHANGE_MAX_TIMEOUTS; i++) {
-        QueuePairTuple outgoingQpt(uintptr_t(logMemoryRegion->addr),
-                                   logMemoryRegion->rkey,
-                                   uint16_t(lid),
-                                   qp->getLocalQpNumber(),
-                                   qp->getInitialPsn(), nonce);
-        QueuePairTuple incomingQpt;
-        bool gotResponse;
-
-        try {
-            gotResponse = clientTryExchangeQueuePairs(sin, &outgoingQpt,
-                                                      &incomingQpt);
-        } catch (...) {
-            delete qp;
-            throw;
-        }
-
-        if (!gotResponse) {
-            // To avoid log clutter, only print a log message for the
-            // first retry.
-            if (i == 0) {
-                LOG(WARNING, "timed out waiting for response; retrying");
-            }
-            continue;
-        }
-        LOG(DEBUG, "connected to %s via local port %d",
-                inet_ntoa(sin->sin_addr), clientPort[0]);
-
-        // plumb up our queue pair with the server's parameters.
-        qp->plumb(&incomingQpt);
-        LOG(DEBUG, "New queue pair nonce 0x%lx, remote log VA 0x%lx, "
-                "remote log rkey 0x%x",
-                incomingQpt.getNonce(), incomingQpt.getLogVA(),
-                incomingQpt.getRkey());
-        remoteLogVA = incomingQpt.getLogVA();
-        remoteLogRkey = incomingQpt.getRkey();
-        return qp;
-    }
-
-    LOG(WARNING, "failed to exchange with server within allotted "
-        "(sent request %u times, local port %d)",
-        QP_EXCHANGE_MAX_TIMEOUTS,
-        clientPort[0]);
-    delete qp;
-    DIE("failed to connect to host");
-}
 
 void
-multiClientTrySetupQueuePair(uint16_t start_port)
+clientTrySetupQueuePair(uint16_t port)
 {
     for (uint16_t host=0;host <numClients;host++) {
-        IpAddress address{hostNames[host].c_str(), static_cast<uint16_t>(start_port)};
+        IpAddress address{hostNames[host].c_str(), static_cast<uint16_t>(port)};
         sockaddr_in *sin = reinterpret_cast<sockaddr_in *>(&address.address);
 
         // Create a new QueuePair and send its parameters to the server so it
@@ -1863,7 +1638,7 @@ multiClientTrySetupQueuePair(uint16_t start_port)
             bool gotResponse;
 
             try {
-                gotResponse = multiClientTryExchangeQueuePairs(sin, &outgoingQpt,
+                gotResponse = clientTryExchangeQueuePairs(sin, &outgoingQpt,
                                                           &incomingQpt,host);
             } catch (...) {
                 delete qp;
@@ -2029,12 +1804,11 @@ static const size_t logSize = 4lu * 1024 * 1024 * 1024;
 
 Mode mode = MODE_ALL;
 bool isServer = false;
-bool isMultiClient = false;
 bool useHugePages = false;
 size_t chunkSize = 100;
 size_t nChunks = 32;
 
-uint64_t benchSend()
+uint64_t benchSend(bool doZeroCopy, QueuePair*qpair)
 {
     Chunk chunks[nChunks];
     uint32_t start = 0;
@@ -2048,7 +1822,7 @@ uint64_t benchSend()
     CycleCounter<> counter{};
 
     for (int i = 0; i < messages ; ++i) {
-        sendZeroCopy(chunks, nChunks, nChunks * chunkSize, clientQP);
+        sendZeroCopy(chunks, nChunks, nChunks * chunkSize, qpair, doZeroCopy);
         if ((i % 100000) == 0) {
             LOG(ERROR, "Chunks tx zero-copy: %u / %u",
                     chunksTransmittedZeroCopy, chunksTransmitted);
@@ -2116,16 +1890,24 @@ uint64_t benchRDMARead()
     return counter.stop();
 }
 
-void dumpStats(Mode mode, uint64_t cycles, int chunksPerMessage, uint32_t sgLen)
+void dumpStats(const char* server, int mode, uint64_t cycles, int chunksPerMessage, size_t currSize)
 {
     double seconds = Cycles::toSeconds(cycles);
     double mbs =
-      (double(messages * chunksPerMessage * chunkSize) / (1u << 20)) / seconds;
+            (double(messages * chunksPerMessage * currSize) / (1u << 20)) / seconds;
     double usPerMessage = seconds / messages * 1e6;
-    printf("> %d %u %0.2f %0.3f\n", mode, sgLen, mbs, usPerMessage);
+    printf(">%s %d %d %lu %0.2f %0.3f\n",server, mode, chunksPerMessage, currSize, mbs, usPerMessage);
+    LOG(INFO, "stats mode:%d server:%s chunksPerMessage:%d currSize:%lu cycles:%lu seconds:%f",mode, server, chunksPerMessage,currSize,cycles, seconds);
 }
 
-void measure() {
+void benchSendQP(bool mode, QueuePair* qpair,uint32_t index){
+    uint64_t cycles = 0;
+    cycles = benchSend(true,qpair);
+    dumpStats(hostNames[index].c_str(), mode, cycles, nChunks, chunkSize);
+}
+
+
+void measure(QueuePair* qpair, const char* server) {
     /* Some junk to do synchronous sends, non-zero-copy
      * Probably need cleanup.
      *
@@ -2147,21 +1929,79 @@ void measure() {
     }
     */
 
-    printf("> mode sgLen mbs usPerMessage\n");
+    printf(">server mode sgLen mbs usPerMessage\n");
 
-    uint64_t cycles = 0;
     if (mode == MODE_SEND || mode == MODE_ALL) {
-        for (uint32_t sgLen = 1; sgLen <= 32; ++sgLen) {
-            MAX_TX_SGE_COUNT = sgLen;
-            LOG(INFO, "Running sends with sgLen %d", sgLen);
-            cycles = benchSend();
-            dumpStats(MODE_SEND, cycles, nChunks, sgLen);
+        size_t iternChunks;
+        size_t iterChunkSize;
+        MAX_TX_SGE_COUNT = 32;
+        for (iternChunks = 1; iternChunks <= 32; ++iternChunks) {
+            nChunks = iternChunks;
+            for (iterChunkSize=1;iterChunkSize <=1024;iterChunkSize*=2){
+                std::vector<std::thread *> clientThreads;
+                for(uint32_t tid=0;tid<numClients;tid++){
+                    clientThreads.push_back(NULL);
+                }
+                chunkSize = iterChunkSize;
+                for (uint32_t tid=0;tid<numClients;tid++){
+                    if(clientThreads[tid]==NULL) {
+                        LOG(INFO,"Running Zero Copy on %s #chunks:%lu size:%lu",hostNames[tid].c_str(),nChunks,chunkSize);
+                        clientThreads[tid] = new std::thread(benchSendQP, true, QueuePairs[tid], tid);
+                    }
+                }
+                for (uint32_t tid=0;tid<numClients;tid++){
+                    if(clientThreads[tid]!=NULL){
+                    clientThreads[tid]->join();
+                        delete clientThreads[tid];
+                        clientThreads[tid] = NULL;
+                    }
+                }
+                sleep(5);
+                reapTxBuffers();
+                for (uint32_t tid=0;tid<numClients;tid++){
+                    if(clientThreads[tid]==NULL) {
+                        LOG(INFO,"Running Copy-All on %s #chunks:%lu size:%lu",hostNames[tid].c_str(),nChunks,chunkSize);
+                        clientThreads[tid] = new std::thread(benchSendQP, true, QueuePairs[tid], tid);
+                    }
+
+                }
+                for (uint32_t tid=0;tid<numClients;tid++){
+                    if(clientThreads[tid]!=NULL){
+                        clientThreads[tid]->join();
+                        delete clientThreads[tid];
+                        clientThreads[tid] = NULL;
+                    }
+                }
+            }
+        }
+        for (iternChunks = 64; iternChunks <= 1024; iternChunks*=2) {
+            nChunks = iternChunks;
+            for (iterChunkSize=1;iterChunkSize <=1024;iterChunkSize*=2){
+                std::vector<std::thread*> clientThreads;
+                for(uint32_t tid=0;tid<numClients;tid++){
+                    clientThreads.push_back(NULL);
+                }
+                sleep(5);
+                reapTxBuffers();
+                chunkSize = iterChunkSize;
+                for (uint32_t tid=0;tid<numClients;tid++){
+                    if(clientThreads[tid]==NULL) {
+                        LOG(INFO,"Running Copy-All on %s #chunks:%lu size:%lu",hostNames[tid].c_str(),nChunks,chunkSize);
+                        clientThreads[tid] = new std::thread(benchSendQP, true, QueuePairs[tid], tid);
+                    }
+                }
+                for (uint32_t tid=0;tid<numClients;tid++){
+                    if(clientThreads[tid]!=NULL){
+                        clientThreads[tid]->join();
+                        delete clientThreads[tid];
+                        clientThreads[tid] = NULL;
+                    }
+                }
+            }
         }
     }
 
-    sleep(5);
-    reapTxBuffers();
-
+    /*
     if (mode == MODE_WRITE || mode == MODE_ALL) {
         uint32_t sgLen = MAX_TX_SGE_COUNT = nChunks;
         LOG(INFO, "Running writes with sgLen %d", sgLen);
@@ -2181,6 +2021,7 @@ void measure() {
         cycles = benchRDMARead();
         dumpStats(MODE_READ, cycles, 1, 1);
     }
+     */
 }
 
 static const char USAGE[] =
@@ -2189,7 +2030,6 @@ R"(ibv-bench.
     Usage:
       ibv-bench server <hostname> [--hugePages]
       ibv-bench client <hostname> [--hugePages] [--chunkSize=SIZE] [--chunksPerMessage=CHUNKS] [--sgLength=SGLEN] [--mode=MODE]
-      ibv-bench client <hostname> --multiClient [--hugePages] [--chunkSize=SIZE] [--chunksPerMessage=CHUNKS] [--sgLength=SGLEN] [--mode=MODE]
       ibv-bench (-h | --help)
 
     Options:
@@ -2199,7 +2039,7 @@ R"(ibv-bench.
       --chunksPerMessage=CHUNKS  Number of objects to send per send/write, ignored for read [default: 32]
       --sgLength=SGLEN           Max S/G list length [default: 32]
       --mode=MODE                send, read, write, or all [default: all]
-      --multiClient              Use multiple servers to target from this client. provide hostname separated by :
+      --hostname                 Use servers separated by : for multiple connections (eg:- client node-0:node-1)
 )";
 
 int main(int argc, const char** argv)
@@ -2216,7 +2056,6 @@ int main(int argc, const char** argv)
     }
 
     isServer = bool(args["server"]) && args["server"].asBool();
-    isMultiClient = bool(args["--multiClient"]) && args["--multiClient"].asBool();
     useHugePages = bool(args["--hugePages"]) && args["--hugePages"].asBool();
     chunkSize = args["--chunkSize"].asLong();
     nChunks = args["--chunksPerMessage"].asLong();
@@ -2236,18 +2075,14 @@ int main(int argc, const char** argv)
 
     LOG(INFO, "Running as %s with %s",
             isServer ? "server" : "client", hostName);
-    LOG(INFO, "Multiclient:%s numClients:%d",isMultiClient?"True":"False",numClients);
-
-    if (isMultiClient){
-        clientSetupSocket = new int[numClients];
-        clientPort = new int[numClients];
-        setupMultiClient();
-        LOG(INFO, "MultiClient setup done");
-    }else {
-        clientSetupSocket = new int;
-        clientPort = new int;
-        setup(isServer, hostName);
+    LOG(INFO, "number of connections:%d", numClients);
+    for (uint32_t i=0;i<numClients;i++){
+        LOG(INFO, "Server[%d]:%s",i,hostNames[i].c_str());
     }
+
+    clientSetupSocket = new int[numClients];
+    clientPort = new int[numClients];
+    setup(isServer);
     // Allocate a GB and register it with the HCA.
     LOG(INFO, "Registering log memory");
     void* base = nullptr;
@@ -2269,27 +2104,12 @@ int main(int argc, const char** argv)
         while (true) {
             poll();
         }
-    } else {
-        if(isMultiClient){
-            for (auto const&host : hostNames){
-                std::cerr<<"host "<<host<<std::endl;
-            }
-            numClients = hostNames.size();
-            LOG(INFO, "Number of clients:%u",numClients);
-            LOG(INFO, "MultiClient setting up queue pairs");
-            multiClientTrySetupQueuePair(PORT);
+    }else {
+            LOG(INFO, "Setting up queue pairs per client-server");
+            clientTrySetupQueuePair(PORT);
             LOG(INFO, "All Clients established qpairs");
+            measure(QueuePairs[0],hostNames[0].c_str());
             return 0;
-
-        }else {
-            LOG(INFO, "Client running stuff");
-
-            clientQP = clientTrySetupQueuePair(hostName, PORT);
-
-            LOG(INFO, "Client established qp");
-
-            measure();
-        }
     }
 
     return 0;
