@@ -1166,8 +1166,8 @@ struct Chunk {
     uint32_t len;
 };
 
-int chunksTransmitted = 0;
-int chunksTransmittedZeroCopy = 0;
+uint64_t chunksTransmitted = 0;
+uint64_t chunksTransmittedZeroCopy = 0;
 
 void
 sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp, bool allowZeroCopy)
@@ -1591,10 +1591,7 @@ clientTryExchangeQueuePairs(struct sockaddr_in *sin,
                 inet_ntoa(recvSin.sin_addr), NTOHS(recvSin.sin_port));
         } else {
             if (outgoingQpt->getNonce() == incomingQpt->getNonce())
-                LOG(INFO, "receive done. outgoing nonce:0x%016lx incoming nonce:0x%016lx",outgoingQpt->getNonce(),incomingQpt->getNonce());
-
-            return true;
-
+                return true;
             LOG(INFO, "bad nonce from %s (expected 0x%016lx, "
                     "got 0x%016lx, port %d); ignoring",
                 inet_ntoa(sin->sin_addr), outgoingQpt->getNonce(),
@@ -1823,8 +1820,8 @@ uint64_t benchSend(bool doZeroCopy, QueuePair*qpair)
 
     for (int i = 0; i < messages ; ++i) {
         sendZeroCopy(chunks, nChunks, nChunks * chunkSize, qpair, doZeroCopy);
-        if ((i % 100000) == 0) {
-            LOG(ERROR, "Chunks tx zero-copy: %u / %u",
+        if ((i % 1000000) == 0) {
+            LOG(ERROR, "Chunks tx zero-copy: %lu / %lu",
                     chunksTransmittedZeroCopy, chunksTransmitted);
         }
     }
@@ -1852,7 +1849,7 @@ uint64_t benchRDMAWrite()
             reapTxBuffers();
         }
         if ((i % 100000) == 0) {
-            LOG(ERROR, "Chunks tx zero-copy: %u / %u",
+            LOG(ERROR, "Chunks tx zero-copy: %lu / %lu",
                     chunksTransmittedZeroCopy, chunksTransmitted);
         }
     }
@@ -1892,18 +1889,18 @@ uint64_t benchRDMARead()
 
 void dumpStats(const char* server, int mode, uint64_t cycles, int chunksPerMessage, size_t currSize)
 {
-    double seconds = Cycles::toSeconds(cycles);
-    double mbs =
-            (double(messages * chunksPerMessage * currSize) / (1u << 20)) / seconds;
-    double usPerMessage = seconds / messages * 1e6;
-    printf(">%s %d %d %lu %0.2f %0.3f\n",server, mode, chunksPerMessage, currSize, mbs, usPerMessage);
-    LOG(INFO, "stats mode:%d server:%s chunksPerMessage:%d currSize:%lu cycles:%lu seconds:%f",mode, server, chunksPerMessage,currSize,cycles, seconds);
+    long double seconds = Cycles::toSeconds(cycles);
+    long double mbs =
+            ((long double)(messages * chunksPerMessage * currSize) / (1u << 20)) / seconds;
+    long double usPerMessage = seconds / messages * 1e6;
+    printf(">%s %d %d %lu %0.2Lf %0.3Lf\n",server, mode, chunksPerMessage, currSize, mbs, usPerMessage);
+    LOG(INFO, "stats mode:%d server:%s chunksPerMessage:%d currSize:%lu cycles:%lu seconds:%Lf",mode, server, chunksPerMessage,currSize,cycles, seconds);
 }
 
 void benchSendQP(bool mode, QueuePair* qpair,uint32_t index){
     uint64_t cycles = 0;
-    cycles = benchSend(true,qpair);
-    dumpStats(hostNames[index].c_str(), mode, cycles, nChunks, chunkSize);
+    cycles = benchSend(mode,qpair);
+    dumpStats(hostNames[index].c_str(), mode?0:1, cycles, nChunks, chunkSize);
 }
 
 
@@ -1929,7 +1926,7 @@ void measure(QueuePair* qpair, const char* server) {
     }
     */
 
-    printf(">server mode sgLen mbs usPerMessage\n");
+    printf(">server copied chunks chunksize mbs\n");
 
     if (mode == MODE_SEND || mode == MODE_ALL) {
         size_t iternChunks;
@@ -1961,7 +1958,7 @@ void measure(QueuePair* qpair, const char* server) {
                 for (uint32_t tid=0;tid<numClients;tid++){
                     if(clientThreads[tid]==NULL) {
                         LOG(INFO,"Running Copy-All on %s #chunks:%lu size:%lu",hostNames[tid].c_str(),nChunks,chunkSize);
-                        clientThreads[tid] = new std::thread(benchSendQP, true, QueuePairs[tid], tid);
+                        clientThreads[tid] = new std::thread(benchSendQP, false, QueuePairs[tid], tid);
                     }
 
                 }
@@ -1987,7 +1984,7 @@ void measure(QueuePair* qpair, const char* server) {
                 for (uint32_t tid=0;tid<numClients;tid++){
                     if(clientThreads[tid]==NULL) {
                         LOG(INFO,"Running Copy-All on %s #chunks:%lu size:%lu",hostNames[tid].c_str(),nChunks,chunkSize);
-                        clientThreads[tid] = new std::thread(benchSendQP, true, QueuePairs[tid], tid);
+                        clientThreads[tid] = new std::thread(benchSendQP, false, QueuePairs[tid], tid);
                     }
                 }
                 for (uint32_t tid=0;tid<numClients;tid++){
