@@ -1820,12 +1820,13 @@ uint64_t benchSend(bool doZeroCopy, QueuePair*qpair)
 
     for (int i = 0; i < messages ; ++i) {
         sendZeroCopy(chunks, nChunks, nChunks * chunkSize, qpair, doZeroCopy);
-        if ((i % 1000000) == 0) {
-            LOG(ERROR, "Chunks tx zero-copy: %lu / %lu",
-                    chunksTransmittedZeroCopy, chunksTransmitted);
-        }
+//        if ((i % 1000000) == 0) {
+//            LOG(ERROR, "Chunks tx zero-copy: %lu / %lu",
+//                    chunksTransmittedZeroCopy, chunksTransmitted);
+//        }
     }
-
+    LOG(ERROR, "Chunks tx zero-copy: %lu / %lu",
+                    chunksTransmittedZeroCopy, chunksTransmitted);
     return counter.stop();
 }
 
