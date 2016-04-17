@@ -1274,7 +1274,7 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
     if (ibv_post_send(qp->qp, &txWorkRequest, &badTxWorkRequest)) {
         DIE("ibv_post_send failed");
     }
-    postSendCycles[index] = postSendCtr.stop();
+    postSendCycles[index]+=postSendCtr.stop();
 }
 
 /**
