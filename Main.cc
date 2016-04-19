@@ -1901,6 +1901,8 @@ void dumpStats(const char* server, int mode, uint64_t cycles, int chunksPerMessa
             ((long double)(messages * chunksPerMessage * currSize) / (1u << 20)) / seconds;
     long double usPerMessage = seconds / messages * 1e6;
     printf(">%s %d %d %lu %0.2Lf %0.3Lf\n",server, mode, chunksPerMessage, currSize, mbs, usPerMessage);
+    LOG(INFO,"cycles per sec: %f",Cycles::perSecond());
+    LOG(INFO,"cycles :%lu, in nanoseconds: %lu",cycles,Cycles::toNanoseconds(cycles));
     LOG(INFO, "stats mode:%d server:%s chunksPerMessage:%d currSize:%lu cycles:%lu ibv_post_send_cycles:%lu seconds:%Lf",mode, server,
         chunksPerMessage,currSize,cycles,sendCycles,seconds);
 }
