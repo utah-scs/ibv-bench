@@ -1906,12 +1906,15 @@ void dumpStats(const char* server, int mode, uint64_t cycles, int chunksPerMessa
     uint64_t totalnsecs = Cycles::toNanoseconds(cycles);
     uint64_t sendnsecs = Cycles::toNanoseconds(sendCycles);
     uint64_t gettxnsecs = Cycles::toNanoseconds(trasmitCycles);
-    long double mbs =
-            ((long double)(messages * chunksPerMessage * currSize) / (1u << 20)) / seconds;
+    // Shows erratic numbers for chunksPerMessage >=256. printing everything so that we can calculate mbs outside
+    // long double mbs =
+    //         ((long double)(messages * chunksPerMessage * currSize) / (1u << 20)) / seconds;
     long double usPerMessage = seconds / messages * 1e6;
-    printf(">%s %d %d %lu %0.2Lf %0.3Lf\n",server, mode, chunksPerMessage, currSize, mbs, usPerMessage);
-    LOG(INFO, "stats mode:%d server:%s chunksPerMessage:%d currSize:%lu messages:%d mfactor:%d seconds:%Lf total_nsecs:%lu send_nsecs:%lu gettx_nsecs:%lu",
-        mode, server, chunksPerMessage, currSize, messages, 1u<<20, seconds, totalnsecs, sendnsecs, gettxnsecs);
+    printf(">%d %s %d %lu %d %d %Lf %lu %lu %lu %0.3Lf\n",mode, server, chunksPerMessage, currSize, messages, 1u<<20,
+           seconds, totalnsecs, sendnsecs, gettxnsecs, usPerMessage);
+    
+    // LOG(INFO, "stats mode:%d server:%s chunksPerMessage:%d currSize:%lu messages:%d mfactor:%d seconds:%Lf total_nsecs:%lu send_nsecs:%lu gettx_nsecs:%lu",
+    //     mode, server, chunksPerMessage, currSize, messages, 1u<<20, seconds, totalnsecs, sendnsecs, gettxnsecs);
 }
 
 void benchSendQP(bool mode, QueuePair* qpair,uint32_t index){
@@ -1945,7 +1948,8 @@ void measure(QueuePair* qpair, const char* server) {
     }
     */
     Cycles::init();
-    printf(">server copied chunks chunksize mbs\n");
+    //printf(">server copied chunks chunksize mbs\n");
+    printf(">copied server chunks chunksize messages mfactor seconds totalnsecs sendnsecs gettxnsecs usPerMessage\n");
 
     if (mode == MODE_SEND || mode == MODE_ALL) {
         size_t iternChunks;
