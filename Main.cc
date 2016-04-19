@@ -75,6 +75,7 @@ int*         clientSetupSocket; // UDP socket for outgoing setup requests
 int*         clientPort;        // Port number associated with
 RAMCloud::SpinLock     mutex("trasmitbufferlock"); //To synchronize getTransmitBuffer calls
 uint64_t*    postSendCycles;     // Cycle counter for post send calls per client;
+uint64_t*    getTrasmitCycles;   // Cycle counter for getting transmit buffers per client;
 
 ibv_context* ctxt;           // device context of the HCA to use
 ibv_pd* pd;
@@ -1135,9 +1136,10 @@ reapTxBuffers()
 }
 
 BufferDescriptor*
-getTransmitBuffer()
+getTransmitBuffer(uint64_t tid)
 {
     // if we've drained our free tx buffer pool, we must wait.
+    CycleCounter<> trasmitCounter{&getTrasmitCycles[tid]};
     std::lock_guard<RAMCloud::SpinLock> lock(mutex);
     while (freeTxBuffers.empty()) {
         reapTxBuffers();
@@ -1174,12 +1176,14 @@ uint64_t chunksTransmittedZeroCopy = 0;
 void
 sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp, bool allowZeroCopy)
 {
+    auto it = std::find(QueuePairs.begin(), QueuePairs.end(), qp);
+    auto tid = std::distance(QueuePairs.begin(), it);
     uint32_t lastChunkIndex = chunkCount - 1;
     ibv_sge isge[MAX_TX_SGE_COUNT];
 
     uint32_t chunksUsed = 0;
     uint32_t sgesUsed = 0;
-    BufferDescriptor* bd = getTransmitBuffer();
+    BufferDescriptor* bd = getTransmitBuffer(tid);
     bd->messageBytes = messageLen;
 
     // The variables below allow us to collect several chunks from the
@@ -1268,13 +1272,12 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
     chunksTransmittedZeroCopy += chunksZeroCopied;
 
     ibv_send_wr* badTxWorkRequest;
-    auto it = std::find(QueuePairs.begin(), QueuePairs.end(), qp);
-    auto index = std::distance(QueuePairs.begin(), it);
+    
     CycleCounter<> postSendCtr{};
     if (ibv_post_send(qp->qp, &txWorkRequest, &badTxWorkRequest)) {
         DIE("ibv_post_send failed");
     }
-    postSendCycles[index]+=postSendCtr.stop();
+    postSendCycles[tid]+=postSendCtr.stop();
 }
 
 /**
@@ -1802,7 +1805,7 @@ QueuePair* clientQP = nullptr;
 
 enum Mode { MODE_SEND, MODE_WRITE, MODE_READ, MODE_ALL };
 
-static const int messages = 10 * 1000 * 1000;
+static const int messages = 5 * 1000 * 1000;
 static const size_t logSize = 4lu * 1024 * 1024 * 1024;
 
 Mode mode = MODE_ALL;
@@ -1836,6 +1839,7 @@ uint64_t benchSend(bool doZeroCopy, QueuePair*qpair)
     return counter.stop();
 }
 
+/*
 uint64_t benchRDMAWrite()
 {
     Chunk chunks[nChunks];
@@ -1893,25 +1897,31 @@ uint64_t benchRDMARead()
 
     return counter.stop();
 }
+*/
 
-void dumpStats(const char* server, int mode, uint64_t cycles, int chunksPerMessage, size_t currSize, uint64_t sendCycles)
+
+void dumpStats(const char* server, int mode, uint64_t cycles, int chunksPerMessage, size_t currSize, uint64_t sendCycles, uint64_t trasmitCycles)
 {
     long double seconds = Cycles::toSeconds(cycles);
+    uint64_t totalnsecs = Cycles::toNanoseconds(cycles);
+    uint64_t sendnsecs = Cycles::toNanoseconds(sendCycles);
+    uint64_t gettxnsecs = Cycles::toNanoseconds(trasmitCycles);
     long double mbs =
             ((long double)(messages * chunksPerMessage * currSize) / (1u << 20)) / seconds;
     long double usPerMessage = seconds / messages * 1e6;
     printf(">%s %d %d %lu %0.2Lf %0.3Lf\n",server, mode, chunksPerMessage, currSize, mbs, usPerMessage);
-    LOG(INFO,"cycles per sec: %f",Cycles::perSecond());
-    LOG(INFO,"cycles :%lu, in nanoseconds: %lu",cycles,Cycles::toNanoseconds(cycles));
-    LOG(INFO, "stats mode:%d server:%s chunksPerMessage:%d currSize:%lu cycles:%lu ibv_post_send_cycles:%lu seconds:%Lf",mode, server,
-        chunksPerMessage,currSize,cycles,sendCycles,seconds);
+    LOG(INFO, "stats mode:%d server:%s chunksPerMessage:%d currSize:%lu messages:%d mfactor:%d seconds:%Lf",
+        mode, server, chunksPerMessage, currSize, messages, 1u<<20, seconds);
+    LOG(INFO, "cpustats mode:%d server:%s chunksPerMessage:%d currSize:%lu total_nsecs:%lu send_nsecs:%lu gettx_nsecs:%lu",
+        mode, server, chunksPerMessage, currSize, totalnsecs, sendnsecs, gettxnsecs);
 }
 
 void benchSendQP(bool mode, QueuePair* qpair,uint32_t index){
     uint64_t cycles = 0;
     postSendCycles[index] = 0;
+    getTrasmitCycles[index] = 0;
     cycles = benchSend(mode,qpair);
-    dumpStats(hostNames[index].c_str(), mode?0:1, cycles, nChunks, chunkSize, postSendCycles[index]);
+    dumpStats(hostNames[index].c_str(), mode?0:1, cycles, nChunks, chunkSize, postSendCycles[index], getTrasmitCycles[index]);
 }
 
 
@@ -1936,7 +1946,7 @@ void measure(QueuePair* qpair, const char* server) {
         postSendAndWait(qp, bd, bd->messageBytes);
     }
     */
-
+    Cycles::init();
     printf(">server copied chunks chunksize mbs\n");
 
     if (mode == MODE_SEND || mode == MODE_ALL) {
@@ -1955,6 +1965,7 @@ void measure(QueuePair* qpair, const char* server) {
                     if(clientThreads[tid]==NULL) {
                         LOG(INFO,"Running Zero Copy on %s #chunks:%lu size:%lu",hostNames[tid].c_str(),nChunks,chunkSize);
                         postSendCycles[tid] = 0;
+                        getTrasmitCycles[tid] = 0;
                         clientThreads[tid] = new std::thread(benchSendQP, true, QueuePairs[tid], tid);
                     }
                 }
@@ -1971,6 +1982,7 @@ void measure(QueuePair* qpair, const char* server) {
                     if(clientThreads[tid]==NULL) {
                         LOG(INFO,"Running Copy-All on %s #chunks:%lu size:%lu",hostNames[tid].c_str(),nChunks,chunkSize);
                         postSendCycles[tid] = 0;
+                        getTrasmitCycles[tid] = 0;
                         clientThreads[tid] = new std::thread(benchSendQP, false, QueuePairs[tid], tid);
                     }
 
@@ -1998,6 +2010,7 @@ void measure(QueuePair* qpair, const char* server) {
                     if(clientThreads[tid]==NULL) {
                         LOG(INFO,"Running Copy-All on %s #chunks:%lu size:%lu",hostNames[tid].c_str(),nChunks,chunkSize);
                         postSendCycles[tid] = 0;
+                        getTrasmitCycles[tid] = 0;
                         clientThreads[tid] = new std::thread(benchSendQP, false, QueuePairs[tid], tid);
                     }
                 }
@@ -2094,6 +2107,7 @@ int main(int argc, const char** argv)
     clientSetupSocket = new int[numClients];
     clientPort = new int[numClients];
     postSendCycles = new uint64_t[numClients];
+    getTrasmitCycles = new uint64_t[numClients];
     setup(isServer);
     // Allocate a GB and register it with the HCA.
     LOG(INFO, "Registering log memory");
