@@ -1805,7 +1805,7 @@ QueuePair* clientQP = nullptr;
 
 enum Mode { MODE_SEND, MODE_WRITE, MODE_READ, MODE_ALL };
 
-static const int messages = 5 * 1000 * 1000;
+static const int messages = 10 * 1000 * 1000;
 static const size_t logSize = 4lu * 1024 * 1024 * 1024;
 
 Mode mode = MODE_ALL;
@@ -1910,10 +1910,8 @@ void dumpStats(const char* server, int mode, uint64_t cycles, int chunksPerMessa
             ((long double)(messages * chunksPerMessage * currSize) / (1u << 20)) / seconds;
     long double usPerMessage = seconds / messages * 1e6;
     printf(">%s %d %d %lu %0.2Lf %0.3Lf\n",server, mode, chunksPerMessage, currSize, mbs, usPerMessage);
-    LOG(INFO, "stats mode:%d server:%s chunksPerMessage:%d currSize:%lu messages:%d mfactor:%d seconds:%Lf",
-        mode, server, chunksPerMessage, currSize, messages, 1u<<20, seconds);
-    LOG(INFO, "cpustats mode:%d server:%s chunksPerMessage:%d currSize:%lu total_nsecs:%lu send_nsecs:%lu gettx_nsecs:%lu",
-        mode, server, chunksPerMessage, currSize, totalnsecs, sendnsecs, gettxnsecs);
+    LOG(INFO, "stats mode:%d server:%s chunksPerMessage:%d currSize:%lu messages:%d mfactor:%d seconds:%Lf total_nsecs:%lu send_nsecs:%lu gettx_nsecs:%lu",
+        mode, server, chunksPerMessage, currSize, messages, 1u<<20, seconds, totalnsecs, sendnsecs, gettxnsecs);
 }
 
 void benchSendQP(bool mode, QueuePair* qpair,uint32_t index){
