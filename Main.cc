@@ -1808,7 +1808,7 @@ QueuePair* clientQP = nullptr;
 
 enum Mode { MODE_SEND, MODE_WRITE, MODE_READ, MODE_ALL };
 
-static const int messages = 10 * 1000 * 1000;
+static const int messages = 20 * 1000 * 1000;
 static const size_t logSize = 4lu * 1024 * 1024 * 1024;
 
 Mode mode = MODE_ALL;
