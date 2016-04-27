@@ -1171,8 +1171,8 @@ struct Chunk {
     uint32_t len;
 };
 
-uint64_t chunksTransmitted = 0;
-uint64_t chunksTransmittedZeroCopy = 0;
+uint64_t* chunksTransmitted;
+uint64_t* chunksTransmittedZeroCopy;
 
 void
 sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp, bool allowZeroCopy)
@@ -1217,9 +1217,9 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
         bool stillRoom = (sgesUsed < MAX_TX_SGE_COUNT - 1 ||
                           ((chunksUsed == lastChunkIndex) &&
                            (unaddedStart == unaddedEnd)));
+        bool enoughLen = chunk.len > MIN_CHUNK_ZERO_COPY_LEN;
         CycleCounter<> memcpyctr{};
-        if (allowZeroCopy && stillRoom && inBounds &&
-            chunk.len > MIN_CHUNK_ZERO_COPY_LEN)
+        if (allowZeroCopy && stillRoom && inBounds && enoughLen)
         {
             if (unaddedStart != unaddedEnd) {
                 isge[sgesUsed] = {
@@ -1239,6 +1239,10 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
             ++sgesUsed;
             ++chunksZeroCopied;
         } else {
+            if (allowZeroCopy){
+                DIE("FATAL ERROR: memcpying in zero copy mode. inBounds:%s stillRoom:%s enoughLen:%s",
+                inBounds?"true":"false",stillRoom?"true":"false",enoughLen?"true":"false");
+            }
             memcpy(unaddedEnd, chunk.p, chunk.len);
             unaddedEnd += chunk.len;
         }
@@ -1271,8 +1275,8 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
     if (messageLen <= MAX_INLINE_DATA)
         txWorkRequest.send_flags |= IBV_SEND_INLINE;
 
-    chunksTransmitted += chunksUsed;
-    chunksTransmittedZeroCopy += chunksZeroCopied;
+    chunksTransmitted[tid] += chunksUsed;
+    chunksTransmittedZeroCopy[tid] += chunksZeroCopied;
 
     ibv_send_wr* badTxWorkRequest;
     
@@ -1346,6 +1350,7 @@ postSend(QueuePair* qp, BufferDescriptor *bd, uint32_t length,
     }
 }
 
+/*
 // Returns 0 on success or ENOMEM if send queue is full.
 int
 rdma(ibv_wr_opcode opcode,
@@ -1527,7 +1532,7 @@ rdmaWrite(QueuePair* qp, Chunk* message, uint32_t chunkCount,
 
     return 0;
 }
-
+*/
 /**
  * Synchronously transmit the packet described by 'bd' on queue pair 'qp'.
  * This function waits to the HCA to return a completion status before
@@ -1819,6 +1824,8 @@ size_t nChunks = 32;
 
 uint64_t benchSend(bool doZeroCopy, QueuePair*qpair)
 {
+    auto it = std::find(QueuePairs.begin(), QueuePairs.end(), qpair);
+    auto tid = std::distance(QueuePairs.begin(), it);
     Chunk chunks[nChunks];
     uint32_t start = 0;
     for (size_t i = 0; i < nChunks; ++i) {
@@ -1837,8 +1844,8 @@ uint64_t benchSend(bool doZeroCopy, QueuePair*qpair)
 //                    chunksTransmittedZeroCopy, chunksTransmitted);
 //        }
     }
-    LOG(ERROR, "Chunks tx zero-copy: %lu / %lu",
-                    chunksTransmittedZeroCopy, chunksTransmitted);
+    LOG(ERROR, "Chunks tx zero-copy[%s]: %lu / %lu",hostNames[tid].c_str(),
+                    chunksTransmittedZeroCopy[tid], chunksTransmitted[tid]);
     return counter.stop();
 }
 
@@ -1902,6 +1909,16 @@ uint64_t benchRDMARead()
 }
 */
 
+void initGlobals(uint8_t numClients)
+{
+    clientSetupSocket = new int[numClients]();
+    clientPort = new int[numClients]();
+    postSendCycles = new uint64_t[numClients]();
+    getTrasmitCycles = new uint64_t[numClients]();
+    memCpyCycles = new uint64_t[numClients]();
+    chunksTransmitted = new uint64_t[numClients]();
+    chunksTransmittedZeroCopy = new uint64_t[numClients]();
+}
 
 void dumpStats(const char* server, int mode, uint64_t cycles, int chunksPerMessage, size_t currSize, uint64_t sendCycles, uint64_t trasmitCycles, uint64_t copyCycles)
 {
@@ -1974,6 +1991,8 @@ void measure(QueuePair* qpair, const char* server) {
                         postSendCycles[tid] = 0;
                         getTrasmitCycles[tid] = 0;
                         memCpyCycles[tid] = 0;
+                        chunksTransmitted[tid]=0;
+                        chunksTransmittedZeroCopy[tid]=0;
                         clientThreads[tid] = new std::thread(benchSendQP, true, QueuePairs[tid], tid);
                     }
                 }
@@ -1992,6 +2011,8 @@ void measure(QueuePair* qpair, const char* server) {
                         postSendCycles[tid] = 0;
                         getTrasmitCycles[tid] = 0;
                         memCpyCycles[tid] = 0;
+                        chunksTransmitted[tid]=0;
+                        chunksTransmittedZeroCopy[tid]=0;
                         clientThreads[tid] = new std::thread(benchSendQP, false, QueuePairs[tid], tid);
                     }
 
@@ -2021,6 +2042,8 @@ void measure(QueuePair* qpair, const char* server) {
                         postSendCycles[tid] = 0;
                         getTrasmitCycles[tid] = 0;
                         memCpyCycles[tid] = 0;
+                        chunksTransmitted[tid]=0;
+                        chunksTransmittedZeroCopy[tid]=0;
                         clientThreads[tid] = new std::thread(benchSendQP, false, QueuePairs[tid], tid);
                     }
                 }
@@ -2109,16 +2132,11 @@ int main(int argc, const char** argv)
 
     LOG(INFO, "Running as %s with %s",
             isServer ? "server" : "client", hostName);
-    LOG(INFO, "number of connections:%d", numClients);
+    LOG(INFO, "number of client server connections:%d", numClients);
     for (uint32_t i=0;i<numClients;i++){
         LOG(INFO, "Server[%d]:%s",i,hostNames[i].c_str());
     }
-
-    clientSetupSocket = new int[numClients];
-    clientPort = new int[numClients];
-    postSendCycles = new uint64_t[numClients];
-    getTrasmitCycles = new uint64_t[numClients];
-    memCpyCycles = new uint64_t[numClients];
+    initGlobals(numClients);
     setup(isServer);
     // Allocate a GB and register it with the HCA.
     LOG(INFO, "Registering log memory");
