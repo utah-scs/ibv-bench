@@ -1218,7 +1218,7 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
                           ((chunksUsed == lastChunkIndex) &&
                            (unaddedStart == unaddedEnd)));
         bool enoughLen = chunk.len > MIN_CHUNK_ZERO_COPY_LEN;
-        CycleCounter<> memcpyctr{};
+        
         if (allowZeroCopy && stillRoom && inBounds && enoughLen)
         {
             if (unaddedStart != unaddedEnd) {
@@ -1243,10 +1243,11 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
                 DIE("FATAL ERROR: memcpying in zero copy mode. inBounds:%s stillRoom:%s enoughLen:%s",
                 inBounds?"true":"false",stillRoom?"true":"false",enoughLen?"true":"false");
             }
+            CycleCounter<> memcpyctr{};
             memcpy(unaddedEnd, chunk.p, chunk.len);
             unaddedEnd += chunk.len;
+            memCpyCycles[tid] += memcpyctr.stop();
         }
-        memCpyCycles[tid] += memcpyctr.stop();
         ++chunksUsed;
     }
     if (unaddedStart != unaddedEnd) {
