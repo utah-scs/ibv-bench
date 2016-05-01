@@ -1130,6 +1130,10 @@ reapTxBuffers()
                 reinterpret_cast<uint64_t>(bd),
                 wcStatusToString(retArray[i].status));
             ++txFailures;
+            if (txFailures>=10000){
+                txFailures=0;
+                DIE("10K or more TxFailures occured. Exiting");
+            }
         }
     }
 
