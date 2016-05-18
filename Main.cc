@@ -97,7 +97,7 @@ struct ThreadMetrics {
 
     static void dumpHeader() {
         printf("copied server chunks chunksize messages mfactor seconds "
-                "totalnsecs sendnsecs gettxnsecs memcpynsecs usPerMessage\n");
+                "totalnsecs sendnsecs gettxnsecs memcpynsecs\n");
     }
 
     void dump(bool copied,
@@ -957,7 +957,11 @@ pollSocket()
 
 }
 
-bool setup(bool isServer)
+/**
+ * \param hostName
+ *      nullptr for clients or the hostname to listen for incoming QP reqs on.
+ */
+bool setup(const char* hostName)
 {
     clientSetupSocket = socket(PF_INET, SOCK_DGRAM, 0);
     if (clientSetupSocket == -1) {
@@ -994,9 +998,9 @@ bool setup(bool isServer)
     clientPort = ntohs(socketAddress.sin_port);
 
     // If this is a server, create a server setup socket and bind it.
-    if (isServer) {
+    if (hostName) {
         sockaddr address;
-        getIpAddress(hostNames[0].c_str(), PORT, &address);
+        getIpAddress(hostName, PORT, &address);
 
         serverSetupSocket = socket(PF_INET, SOCK_DGRAM, 0);
         if (serverSetupSocket == -1) {
@@ -1017,7 +1021,7 @@ bool setup(bool isServer)
             exit(-1);
         }
 
-        LOG(NOTICE, "InfRc listening on UDP: %s:%d", hostNames[0].c_str(), PORT);
+        LOG(NOTICE, "InfRc listening on UDP: %s:%d", hostName, PORT);
 
         std::thread t{pollSocket};
         t.detach();
@@ -1200,9 +1204,6 @@ struct Chunk {
     void* p;
     uint32_t len;
 };
-
-uint64_t* chunksTransmitted;
-uint64_t* chunksTransmittedZeroCopy;
 
 void
 sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp, bool allowZeroCopy)
@@ -1792,7 +1793,7 @@ int main(int argc, const char** argv)
         LOG(INFO, " > %s", hostName.c_str());
     LOG(INFO, "number of client server connections:%d", numClients);
 
-    setup(isServer);
+    setup(isServer ? hostNames.at(0).c_str() : nullptr);
     // Allocate a GB and register it with the HCA.
     LOG(INFO, "Registering log memory");
     void* base = nullptr;
