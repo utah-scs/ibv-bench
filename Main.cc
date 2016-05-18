@@ -75,7 +75,7 @@ int          serverSetupSocket; // UDP socket for incoming setup requests;
                                 // -1 means we're not a server
 int          clientSetupSocket; // UDP socket for outgoing setup requests
 int          clientPort;        // Port number associated with
-RAMCloud::SpinLock     mutex("trasmitbufferlock"); //To synchronize getTransmitBuffer calls
+RAMCloud::SpinLock     mutex("getTransmitBuffer"); //To synchronize getTransmitBuffer calls
 
 static const int messages = 5 * 1000 * 1000;
 static const size_t logSize = 4lu * 1024 * 1024 * 1024;
@@ -1171,7 +1171,7 @@ BufferDescriptor*
 getTransmitBuffer()
 {
     // if we've drained our free tx buffer pool, we must wait.
-    CycleCounter<> trasmitCounter{&threadMetrics.getTransmitCycles};
+    CycleCounter<> transmitCounter{&threadMetrics.getTransmitCycles};
     std::lock_guard<RAMCloud::SpinLock> lock(mutex);
     while (freeTxBuffers.empty()) {
         reapTxBuffers();
@@ -1693,6 +1693,9 @@ class Benchmark {
 
         for (auto& thread : threads)
             thread.join();
+
+        while (freeTxBuffers.size() < MAX_TX_QUEUE_DEPTH)
+            reapTxBuffers();
     }
 
     void entry(ThreadState* threadState) {
@@ -1728,8 +1731,10 @@ class Benchmark {
     }
 
     void run(ThreadState* threadState) {
-        for (int i = 0; i < messages ; ++i)
-            sendZeroCopy(&threadState->chunks[0], nChunks, nChunks * chunkSize, threadState->qp.get(), doZeroCopy);
+        for (int i = 0; i < messages ; ++i) {
+            sendZeroCopy(&threadState->chunks[0], nChunks, nChunks * chunkSize,
+                         threadState->qp.get(), doZeroCopy);
+        }
     }
 
   private:
