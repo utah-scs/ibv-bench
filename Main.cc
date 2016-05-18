@@ -153,9 +153,6 @@ BufferDescriptor txDescriptors[MAX_TX_QUEUE_DEPTH];
 
 std::vector<BufferDescriptor*> freeTxBuffers{};
 
-uint8_t numClients = 1;
-std::vector<std::string> hostNames{};
-
 uintptr_t logMemoryBase = 0;
 size_t logMemoryBytes = 0;
 ibv_mr* logMemoryRegion;
@@ -1785,13 +1782,12 @@ int main(int argc, const char** argv)
     chunkSize = args["--chunkSize"].asLong();
     nChunks = args["--chunksPerMessage"].asLong();
 
-    hostNames = args["<hostname>"].asStringList();
+    std::vector<std::string> hostNames = args["<hostname>"].asStringList();
 
-    numClients = hostNames.size();
     LOG(INFO, "Running as %s", isServer ? "server" : "client");
     for (const auto& hostName : hostNames)
         LOG(INFO, " > %s", hostName.c_str());
-    LOG(INFO, "number of client server connections:%d", numClients);
+    LOG(INFO, "Number of client server connections: %lu", hostNames.size());
 
     setup(isServer ? hostNames.at(0).c_str() : nullptr);
     // Allocate a GB and register it with the HCA.
