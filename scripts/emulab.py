@@ -18,7 +18,8 @@ def ssh(server, cmd, checked=True):
 class BenchmarkRunner(object):
 
     def __init__(self, server, extra_args):
-        self.extra_args = extra_args + ' --hugePages'
+        self.extra_server_args = '--hugePages'
+        self.extra_client_args = extra_args + ' --hugePages'
         self.node_type = None
         self.server = server
         self.node_names = []
@@ -49,39 +50,46 @@ class BenchmarkRunner(object):
                 self.node_type = host.get('name')
 
     def get_name(self):
-        return str(len(self.node_names[1:])) + "-" + \
-                   self.node_type + "-clients-" + \
-                   self.start_time.strftime('%Y%m%d%H%M%S')
+        return (self.start_time.strftime('%Y%m%d%H%M%S') +
+                '-%d-clients-%s' % (len(self.node_names) - 1, self.node_type))
 
     def collect_results(self):
         assert(self.end_time != None)
 
-        commit_mesg = "Commit: " + \
-                       subprocess.check_output('git log -1 --pretty=format:"%h%x09%an%x09%ad%x09%s"',
-                                                shell=True)
-        logger_mesg = "Logged by: " + self.node_names[0] + \
-                                     "(" + self.host_names[0] + ")"
-        duration_mesg = "Duration: " + str(self.end_time - self.start_time)
+        log_dir = os.path.join('logs', self.get_name())
+        try:
+            os.makedirs(log_dir)
+        except:
+            pass
+        try:
+            latest = os.path.join('logs', 'latest')
+            os.unlink(latest)
+            os.symlink(self.get_name(), latest)
+        except:
+            pass
 
-        completion_mesg = self.end_time.strftime(
-                            'Experiment completed at %d/%m/%y %H:%M:%S')
-        legend = "\n".join([commit_mesg, logger_mesg, 
-                                 completion_mesg, duration_mesg])
-
-        log_dir = os.path.join(os.path.dirname(__file__), self.get_name())
-        subprocess.check_output("mkdir -p %s" % log_dir, shell=True)
         legend_file_name = os.path.join(log_dir, "legend_%s.log" % self.get_name())
-        with open(legend_file_name) as f:
-            f.write(self.legend)
-        subprocess.check_output("rsync -ave ssh %s:~/ibv-bench/*.log %s/" % (self.host_names[0], log_dir),
-                                shell=True, stdout=sys.stdout)
+        with open(legend_file_name, 'w') as f:
+            print >> f, 'Commit: %s' % subprocess.check_output('git log -1 --oneline', shell=True)
+            print >> f, 'Run on: %s' % ' '.join(self.with_fqdn(self.host_names))
+            print >> f, self.end_time.strftime('Experiment completed at %d/%m/%y %H:%M:%S')
+            print >> f, 'Experiment run time: %s' % str(self.end_time - self.start_time)
+        subprocess.check_call("rsync -ave ssh %s:~/ibv-bench/%s*.log %s/" %
+                (self.host_names[0], self.get_name(), log_dir),
+                shell=True, stdout=sys.stdout)
 
+        try:
+            out = os.path.join('logs', 'latest', 'out')
+            os.symlink('%s-out.log' % self.get_name(), out)
+        except:
+            pass
 
     def with_fqdn(self, hosts):
         return ['%s.apt.emulab.net' % h for h in hosts]
 
     def send_code(self, server):
-        subprocess.check_call("rsync -ave ssh ./ %s:~/ibv-bench/" % server,
+        subprocess.check_call("rsync -ave ssh --exclude 'logs/*' " +
+                              "./ %s:~/ibv-bench/" % server,
                               shell=True, stdout=sys.stdout)
 
     def compile_code(self, server):
@@ -90,10 +98,9 @@ class BenchmarkRunner(object):
     def start_servers(self):
         procs = []
         for host, node in zip(self.host_names, self.node_names):
-            procs.append(subprocess.Popen(['ssh', host,
-                              '(cd ibv-bench; ' +
-                              './ibv-bench server %s %s &> server_%s.log)' %
-                                    (node, self.extra_args, node)]))
+            cmd = ('(cd ibv-bench; ./ibv-bench server %s %s > server_%s.log 2>&1)' %
+                        (node, self.extra_server_args, node))
+            procs.append(subprocess.Popen(['ssh', host, cmd]))
         return procs
 
     def killall(self):
@@ -119,7 +126,7 @@ class BenchmarkRunner(object):
                 '(cd ibv-bench; ' +
                 './ibv-bench client %s %s > %s-out.log 2> %s-err.log)'
                     % (' '.join(self.node_names[1:]),
-                       self.extra_args,
+                       self.extra_client_args,
                        self.get_name(),
                        self.get_name()))
         finally:

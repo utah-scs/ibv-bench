@@ -103,7 +103,7 @@ struct ThreadMetrics {
               double seconds,
               double warmupSeconds)
     {
-        printf("%d %s %d %lu %f %f %d %f %lu %lu %lu %lu\n",
+        printf("%d %s %d %lu %f %f %f %lu %lu %lu %lu\n",
                copied,
                server,
                chunksPerMessage,
@@ -1496,6 +1496,9 @@ clientTrySetupQueuePair(const char* server, uint16_t port)
             // first retry.
             if (i == 0) {
                 LOG(WARNING, "timed out waiting for response; retrying");
+            }
+            if (i > 1000) {
+                DIE("Couldn't establish queue pair with %s:%u", server, port);
             }
             continue;
         }
