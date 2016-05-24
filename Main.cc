@@ -47,7 +47,7 @@ static const uint32_t MAX_TX_QUEUE_DEPTH = 16;
 // need an entry for the headers.
 // 31 seems to be the limit on this. Not sure why, because the qp's are
 // initialized with a max sge limit of 1 anyway.
-uint32_t MAX_TX_SGE_COUNT = 26;
+const uint32_t MAX_TX_SGE_COUNT = 32;
 const uint32_t MIN_CHUNK_ZERO_COPY_LEN = 0;
 
 static const uint32_t QP_EXCHANGE_MAX_TIMEOUTS = 10;
@@ -77,12 +77,7 @@ int          clientSetupSocket; // UDP socket for outgoing setup requests
 int          clientPort;        // Port number associated with
 RAMCloud::SpinLock     mutex("getTransmitBuffer"); //To synchronize getTransmitBuffer calls
 
-static const int messages = 5 * 1000 * 1000;
 static const size_t logSize = 4lu * 1024 * 1024 * 1024;
-bool isServer = false;
-bool useHugePages = false;
-size_t chunkSize = 100;
-size_t nChunks = 32;
 
 struct ThreadMetrics {
     ThreadMetrics()
@@ -96,7 +91,7 @@ struct ThreadMetrics {
     void reset() { new (this) ThreadMetrics{}; }
 
     static void dumpHeader() {
-        printf("copied server chunks chunksize messages mfactor seconds "
+        printf("copied server chunks chunksize seconds warmup totalsecs "
                 "totalnsecs sendnsecs gettxnsecs memcpynsecs\n");
     }
 
@@ -104,15 +99,17 @@ struct ThreadMetrics {
               const char* server,
               uint64_t cycles,
               int chunksPerMessage,
-              size_t chunkSize)
+              size_t chunkSize,
+              double seconds,
+              double warmupSeconds)
     {
-        printf("%d %s %d %lu %d %d %f %lu %lu %lu %lu\n",
+        printf("%d %s %d %lu %f %f %d %f %lu %lu %lu %lu\n",
                copied,
                server,
                chunksPerMessage,
                chunkSize,
-               messages,
-               1u << 20,
+               seconds,
+               warmupSeconds,
                Cycles::toSeconds(cycles),
                Cycles::toNanoseconds(cycles),
                Cycles::toNanoseconds(postSendCycles),
@@ -1662,11 +1659,15 @@ class Benchmark {
     Benchmark(const std::vector<std::string>& servers,
               size_t nChunks,
               size_t chunkSize,
-              bool doZeroCopy)
+              bool doZeroCopy,
+              double seconds,
+              double warmupSeconds)
       : servers{servers}
       , nChunks{nChunks}
       , chunkSize{chunkSize}
       , doZeroCopy{doZeroCopy}
+      , seconds{seconds}
+      , warmupSeconds{warmupSeconds}
       , threads{}
       , threadStates{}
       , nReady{}
@@ -1714,14 +1715,19 @@ class Benchmark {
         nReady++;
         while (!go);
 
+        // warmup
+        run(threadState, warmupSeconds);
+
+        threadMetrics.reset();
+
         uint64_t cycles = 0;
         {
             CycleCounter<> counter{&cycles};
-            run(threadState);
+            run(threadState, seconds);
         }
 
         threadMetrics.dump(!doZeroCopy, threadState->qp->getPeerName(),
-                           cycles, nChunks, chunkSize);
+                           cycles, nChunks, chunkSize, seconds, warmupSeconds);
 
         LOG(ERROR, "Chunks tx zero-copy[%s]: %lu / %lu", threadState->qp->getPeerName(),
                         threadMetrics.chunksTransmittedZeroCopy, threadMetrics.chunksTransmitted);
@@ -1730,10 +1736,14 @@ class Benchmark {
             DIE("Not all chunks were zero copied in zero copy mode");
     }
 
-    void run(ThreadState* threadState) {
-        for (int i = 0; i < messages ; ++i) {
+    void run(ThreadState* threadState, double seconds) {
+        const uint64_t cyclesToRun = Cycles::fromSeconds(seconds);
+        const uint64_t start = Cycles::rdtsc();
+        while (true) {
             sendZeroCopy(&threadState->chunks[0], nChunks, nChunks * chunkSize,
                          threadState->qp.get(), doZeroCopy);
+            if (Cycles::rdtsc() - start > cyclesToRun)
+                break;
         }
     }
 
@@ -1743,6 +1753,9 @@ class Benchmark {
     const size_t nChunks;
     const size_t chunkSize;
     const bool doZeroCopy;
+
+    const double seconds;
+    const double warmupSeconds;
 
     std::deque<std::thread> threads;
     std::deque<ThreadState> threadStates;
@@ -1756,15 +1769,18 @@ R"(ibv-bench.
 
     Usage:
       ibv-bench server <hostname> [--hugePages]
-      ibv-bench client <hostname>... [--hugePages] [--chunkSize=SIZE] [--chunksPerMessage=CHUNKS] [--sgLength=SGLEN]
+      ibv-bench client <hostname>... [--hugePages] [--minChunkSize=SIZE] [--maxChunkSize=SIZE] [--minChunksPerMessage=CHUNKS] [--maxChunksPerMessage=CHUNKS] [--seconds=SECONDS] [--warmup=SECONDS]
       ibv-bench (-h | --help)
 
     Options:
-      -h --help                  Show this screen
-      --hugePages                Use huge pages
-      --chunkSize=SIZE           Size of individual objects [default: 100]
-      --chunksPerMessage=CHUNKS  Number of objects to send per send/write, ignored for read [default: 32]
-      --sgLength=SGLEN           Max S/G list length [default: 32]
+      -h --help                     Show this screen
+      --hugePages                   Use huge pages
+      --minChunkSize=SIZE           Smallest size of individual objects [default: 1]
+      --maxChunkSize=SIZE           Smallest size of individual objects [default: 1024]
+      --minChunksPerMessage=CHUNKS  Min Number of objects to send per send [default: 1]
+      --maxChunksPerMessage=CHUNKS  Max number of objects to send per send [default: 32]
+      --seconds=SECONDS             Number of seconds to run per chunk count/size pair [default: 10]
+      --warmup=SECONDS              Number of seconds to run per chunk count/size pair before starting measurment [default: 5]
 )";
 
 int main(int argc, const char** argv)
@@ -1778,14 +1794,26 @@ int main(int argc, const char** argv)
                          "ibv-bench 0.2");  // version string
 
     // Dump command line args for debugging.
-    for (auto const& arg : args) {
+    for (auto const& arg : args)
         std::cerr << arg.first <<  " " << arg.second << std::endl;
-    }
 
-    isServer = bool(args["server"]) && args["server"].asBool();
-    useHugePages = bool(args["--hugePages"]) && args["--hugePages"].asBool();
-    chunkSize = args["--chunkSize"].asLong();
-    nChunks = args["--chunksPerMessage"].asLong();
+    const bool isServer = bool(args["server"]) && args["server"].asBool();
+    const bool useHugePages = bool(args["--hugePages"]) &&
+                              args["--hugePages"].asBool();
+    const size_t minChunkSize = args["--minChunkSize"].asLong();
+    const size_t maxChunkSize = args["--maxChunkSize"].asLong();
+    const size_t minChunksPerMessage = args["--minChunksPerMessage"].asLong();
+    const size_t maxChunksPerMessage = args["--maxChunksPerMessage"].asLong();
+
+    const double seconds = double(args["--seconds"].asLong());
+    const double warmupSeconds = double(args["--warmup"].asLong());
+
+    assert(minChunkSize > 0);
+    assert(maxChunkSize <= 1024);
+    assert(minChunksPerMessage > 0);
+    assert(maxChunksPerMessage <= 32);
+    assert(seconds > 0.);
+    assert(warmupSeconds >= 0.);
 
     std::vector<std::string> hostNames = args["<hostname>"].asStringList();
 
@@ -1819,42 +1847,37 @@ int main(int argc, const char** argv)
     } else {
         LOG(INFO, "Running client benchmarks");
 
-        // TODO(stutsman) We need to get away from setting these types of
-        // globals. Confusing.
-        MAX_TX_SGE_COUNT = 32;
-
         ThreadMetrics::dumpHeader();
 
-        for (size_t chunkSize=1; chunkSize <= 1024; chunkSize*=2) {
-            // TODO(stutsman) We need to get away from setting these types of
-            // globals. Confusing.
-            for (nChunks = 1; nChunks <= 32; ++nChunks) {
+        for (size_t chunkSize=minChunkSize; chunkSize <= maxChunkSize; chunkSize*=2) {
+            for (size_t nChunks = minChunksPerMessage;
+                 nChunks <= maxChunksPerMessage && nChunks <= 32;
+                 ++nChunks)
+            {
                 {
-                    threadMetrics.reset();
                     LOG(INFO, "Running Zero Copy on #chunks: %lu size: %lu",
                             nChunks, chunkSize);
-                    Benchmark bench{hostNames, nChunks, chunkSize, true /* 0-copy */};
+                    Benchmark bench{hostNames, nChunks, chunkSize,
+                                    true /* 0-copy */, seconds, warmupSeconds};
                     bench.start();
                 }
                 {
-                    threadMetrics.reset();
                     LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
                             nChunks, chunkSize);
-                    Benchmark bench{hostNames, nChunks, chunkSize, false /* no 0-copy */};
+                    Benchmark bench{hostNames, nChunks, chunkSize,
+                                    false /* no 0-copy */, seconds, warmupSeconds};
                     bench.start();
                 }
             }
             // Power of 2 number of chunks
-            for (nChunks = 64; nChunks <= 1024; nChunks *=2) {
-                threadMetrics.reset();
+            for (size_t nChunks = 64; nChunks <= maxChunksPerMessage; nChunks *=2) {
                 LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
                         nChunks, chunkSize);
-                Benchmark bench{hostNames, nChunks, chunkSize, true /* doZeroCopy */};
+                Benchmark bench{hostNames, nChunks, chunkSize,
+                                false /* doZeroCopy */, seconds, warmupSeconds};
                 bench.start();
             }
         }
-
-        return 0;
     }
 
     return 0;
