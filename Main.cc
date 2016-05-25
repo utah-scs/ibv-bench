@@ -91,8 +91,8 @@ struct ThreadMetrics {
     void reset() { new (this) ThreadMetrics{}; }
 
     static void dumpHeader() {
-        printf("copied server chunks chunksize seconds warmup totalsecs "
-                "totalnsecs sendnsecs gettxnsecs memcpynsecs\n");
+        printf("copied server chunksPerMessage chunkSize seconds warmupSeconds totalSecs "
+                "totalNSecs sendNSecs getTxNSecs memcpyNSecs chunksTx chunksTxZeroCopy mbs\n");
     }
 
     void dump(bool copied,
@@ -103,7 +103,9 @@ struct ThreadMetrics {
               double seconds,
               double warmupSeconds)
     {
-        printf("%d %s %d %lu %f %f %f %lu %lu %lu %lu\n",
+        const double mbs =
+            chunkSize * chunksTransmitted / seconds / (1024 * 1024);
+        printf("%d %s %d %lu %f %f %f %lu %lu %lu %lu %lu %lu %f\n",
                copied,
                server,
                chunksPerMessage,
@@ -114,7 +116,11 @@ struct ThreadMetrics {
                Cycles::toNanoseconds(cycles),
                Cycles::toNanoseconds(postSendCycles),
                Cycles::toNanoseconds(getTransmitCycles),
-               Cycles::toNanoseconds(memCpyCycles));
+               Cycles::toNanoseconds(memCpyCycles),
+               chunksTransmitted,
+               chunksTransmittedZeroCopy,
+               mbs);
+        fflush(stdout);
     }
 
     uint64_t postSendCycles;     // Cycle counter for post send calls per client;
@@ -1690,10 +1696,10 @@ class Benchmark {
         }
         LOG(INFO, "All Clients established qpairs");
 
-        go = true;
-
         while (nReady != servers.size())
             std::this_thread::yield();
+
+        go = true;
 
         for (auto& thread : threads)
             thread.join();
@@ -1814,7 +1820,7 @@ int main(int argc, const char** argv)
     assert(minChunkSize > 0);
     assert(maxChunkSize <= 1024);
     assert(minChunksPerMessage > 0);
-    assert(maxChunksPerMessage <= 32);
+    assert(maxChunksPerMessage <= 1024);
     assert(seconds > 0.);
     assert(warmupSeconds >= 0.);
 

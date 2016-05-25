@@ -17,7 +17,8 @@ def ssh(server, cmd, checked=True):
 
 class BenchmarkRunner(object):
 
-    def __init__(self, server, extra_args):
+    def __init__(self, server, extra_args, num_clients=None):
+        self.num_clients = num_clients
         self.extra_server_args = '--hugePages'
         self.extra_client_args = extra_args + ' --hugePages'
         self.node_type = None
@@ -29,6 +30,9 @@ class BenchmarkRunner(object):
 
     def __enter__(self):
         self.populate_hosts()
+        if self.num_clients is not None:
+            self.node_names = self.node_names[:self.num_clients + 1]
+            self.host_names = self.host_names[:self.num_clients + 1]
         self.start_time = datetime.datetime.now()
         return self 
 
@@ -57,18 +61,21 @@ class BenchmarkRunner(object):
         assert(self.end_time != None)
 
         log_dir = os.path.join('logs', self.get_name())
+        latest = os.path.join('logs', 'latest')
         try:
             os.makedirs(log_dir)
         except:
             pass
         try:
-            latest = os.path.join('logs', 'latest')
             os.unlink(latest)
+        except:
+            pass
+        try:
             os.symlink(self.get_name(), latest)
         except:
             pass
 
-        legend_file_name = os.path.join(log_dir, "legend_%s.log" % self.get_name())
+        legend_file_name = os.path.join(log_dir, "legend-%s.log" % self.get_name())
         with open(legend_file_name, 'w') as f:
             print >> f, 'Commit: %s' % subprocess.check_output('git log -1 --oneline', shell=True)
             print >> f, 'Run on: %s' % ' '.join(self.with_fqdn(self.host_names))
@@ -97,7 +104,7 @@ class BenchmarkRunner(object):
 
     def start_servers(self):
         procs = []
-        for host, node in zip(self.host_names, self.node_names):
+        for host, node in zip(self.host_names[1:], self.node_names[1:]):
             cmd = ('(cd ibv-bench; ./ibv-bench server %s %s > server_%s.log 2>&1)' %
                         (node, self.extra_server_args, node))
             procs.append(subprocess.Popen(['ssh', host, cmd]))
@@ -135,7 +142,6 @@ class BenchmarkRunner(object):
             self.collect_results()
             print 'Results collected'
 
-
 def main():
     if not os.path.exists(os.path.join('scripts', 'emulab.py')):
         raise Exception('Run this directly from top-level of the project.')
@@ -146,10 +152,14 @@ def main():
     server = sys.argv[1]
 
     extra_args = ''
-    if len(sys.argv) > 3:
-        extra_args = ' '.join(sys.argv[2:])
+    num_clients = None
+    for arg in sys.argv[2:]:
+        if arg.startswith('--clients='):
+            num_clients = int(arg.split('=')[1])
+        else:
+            extra_args +=  '%s ' % arg
 
-    with BenchmarkRunner(server, extra_args) as br:
+    with BenchmarkRunner(server, extra_args, num_clients=num_clients) as br:
         print 'Found hosts %s' % ' '.join(br.host_names)
         cmd = 'run'
         if len(sys.argv) == 3:
