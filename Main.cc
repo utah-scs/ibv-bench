@@ -1646,6 +1646,16 @@ void registerMemory(void* base, size_t bytes)
     LOG(NOTICE, "Registered %Zd bytes at %p", bytes, base);
 }
 
+void pinTo(size_t i)
+{
+   cpu_set_t cpuset;
+   CPU_ZERO(&cpuset);
+   CPU_SET(i, &cpuset);
+   int r = pthread_setaffinity_np(pthread_self(),
+                                  sizeof(cpu_set_t), &cpuset);
+   assert(r == 0);
+}
+
 /**
  * Runs a benchmark. Makes life easier by spawning threads and hoooking them
  * up to thread-specific stats and state, synchronizing them on start/stop,
@@ -1691,7 +1701,7 @@ class Benchmark {
             threadStates.emplace_back(clientTrySetupQueuePair(servers.at(i).c_str(),
                                                               PORT));
             threads.emplace_back(std::thread{&Benchmark::entry,
-                                 this, &threadStates.back()});
+                                 this, i, &threadStates.back()});
 
         }
         LOG(INFO, "All Clients established qpairs");
@@ -1708,9 +1718,11 @@ class Benchmark {
             reapTxBuffers();
     }
 
-    void entry(ThreadState* threadState) {
+    void entry(size_t threadNum, ThreadState* threadState) {
         LOG(DEBUG, "Running benchmark with %lu clients %lu chunksPerMessage "
                 "%lu chunkSize", servers.size(), nChunks, chunkSize);
+
+        pinTo(threadNum);
 
         threadState->chunks.resize(nChunks);
         uint32_t start = 0;
