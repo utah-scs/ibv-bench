@@ -32,7 +32,7 @@
 
 static const int PORT = 12240;
 
-static const uint32_t MAX_INLINE_DATA = 400;
+static const uint32_t MAX_INLINE_DATA = 0;
 static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 32;
 
 // Since we always use at most 1 SGE per receive request, there is no need
@@ -41,7 +41,7 @@ static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 32;
 // Infiniband controller needs to fetch more data from host memory,
 // which results in a higher number of on-controller cache misses.
 static const uint32_t MAX_SHARED_RX_SGE_COUNT = 1;
-static const uint32_t MAX_TX_QUEUE_DEPTH = 16;
+static const uint32_t MAX_TX_QUEUE_DEPTH = 128;
 
 // With 64 KB seglets 1 MB is fractured into 16 or 17 pieces, plus we
 // need an entry for the headers.
@@ -75,7 +75,6 @@ int          serverSetupSocket; // UDP socket for incoming setup requests;
                                 // -1 means we're not a server
 int          clientSetupSocket; // UDP socket for outgoing setup requests
 int          clientPort;        // Port number associated with
-RAMCloud::SpinLock     mutex("getTransmitBuffer"); //To synchronize getTransmitBuffer calls
 
 static const size_t logSize = 4lu * 1024 * 1024 * 1024;
 
@@ -84,6 +83,9 @@ struct ThreadMetrics {
         : postSendCycles{}
         , getTransmitCycles{}
         , memCpyCycles{}
+        , addingGECycles{}
+        , setupWRCycles{}
+        , miscCycles{}
         , chunksTransmitted{}
         , chunksTransmittedZeroCopy{}
     {}
@@ -91,8 +93,11 @@ struct ThreadMetrics {
     void reset() { new (this) ThreadMetrics{}; }
 
     static void dumpHeader() {
-        printf("copied server chunksPerMessage chunkSize seconds warmupSeconds totalSecs "
-                "totalNSecs sendNSecs getTxNSecs memcpyNSecs chunksTx chunksTxZeroCopy mbs\n");
+        printf("copied server chunksPerMessage chunkSize seconds warmupSeconds "
+                "totalSecs totalNSecs "
+                "sendNSecs getTxNSecs memcpyNSecs addingGENSecs setupWRNSecs "
+                "miscCycles "
+                "chunksTx chunksTxZeroCopy mbs\n");
     }
 
     void dump(bool copied,
@@ -105,7 +110,7 @@ struct ThreadMetrics {
     {
         const double mbs =
             chunkSize * chunksTransmitted / seconds / (1024 * 1024);
-        printf("%d %s %d %lu %f %f %f %lu %lu %lu %lu %lu %lu %f\n",
+        printf("%d %s %d %lu %f %f %f %lu %lu %lu %lu %lu %lu %lu %lu %lu %f\n",
                copied,
                server,
                chunksPerMessage,
@@ -117,15 +122,21 @@ struct ThreadMetrics {
                Cycles::toNanoseconds(postSendCycles),
                Cycles::toNanoseconds(getTransmitCycles),
                Cycles::toNanoseconds(memCpyCycles),
+               Cycles::toNanoseconds(addingGECycles),
+               Cycles::toNanoseconds(setupWRCycles),
+               Cycles::toNanoseconds(miscCycles),
                chunksTransmitted,
                chunksTransmittedZeroCopy,
                mbs);
         fflush(stdout);
     }
 
-    uint64_t postSendCycles;     // Cycle counter for post send calls per client;
-    uint64_t getTransmitCycles;  // Cycle counter for getting transmit buffers per client;
-    uint64_t memCpyCycles;       // Cycle counter for mem copying objects in copied=1 mode;
+    uint64_t postSendCycles;     // Cycles for post send calls per client;
+    uint64_t getTransmitCycles;  // Cycles for getting transmit buffers per client;
+    uint64_t memCpyCycles;       // Cycles for mem copying objects in copied=1 mode;
+    uint64_t addingGECycles;     // Cycles adding gather list entries for zero-copy;
+    uint64_t setupWRCycles;      // Cycles to create the WR sent to post_send;
+    uint64_t miscCycles;         // Cycle counter for perf debugging.
 
     uint64_t chunksTransmitted;
     uint64_t chunksTransmittedZeroCopy;
@@ -155,6 +166,7 @@ void* txBase;
 BufferDescriptor txDescriptors[MAX_TX_QUEUE_DEPTH];
 
 std::vector<BufferDescriptor*> freeTxBuffers{};
+RAMCloud::SpinLock freeTxBufferMutex("freeTxBuffers");
 
 uintptr_t logMemoryBase = 0;
 size_t logMemoryBytes = 0;
@@ -1147,6 +1159,7 @@ reapTxBuffers()
     ibv_wc retArray[MAX_TX_QUEUE_DEPTH];
     int n = ibv_poll_cq(commonTxCq, MAX_TX_QUEUE_DEPTH, retArray);
 
+    std::lock_guard<RAMCloud::SpinLock> lock{freeTxBufferMutex};
     for (int i = 0; i < n; i++) {
         BufferDescriptor* bd =
             reinterpret_cast<BufferDescriptor*>(retArray[i].wr_id);
@@ -1173,31 +1186,19 @@ reapTxBuffers()
 BufferDescriptor*
 getTransmitBuffer()
 {
-    // if we've drained our free tx buffer pool, we must wait.
     CycleCounter<> transmitCounter{&threadMetrics.getTransmitCycles};
-    std::lock_guard<RAMCloud::SpinLock> lock(mutex);
-    while (freeTxBuffers.empty()) {
-        reapTxBuffers();
-
-        if (freeTxBuffers.empty()) {
-            // We are temporarily out of buffers. Time how long it takes
-            // before a transmit buffer becomes available again (a long
-            // time could indicate deadlock); in the normal case this code
-            // is not invoked.
-            uint64_t start = rdtsc();
-            while (freeTxBuffers.empty())
-                reapTxBuffers();
-            uint64_t wait = rdtsc() - start;
-            if (wait > 3lu * 5 * 1000 * 1000)  {
-                LOG(WARNING, "Long delay waiting for transmit buffers "
-                        "(%lu ticks); deadlock or target crashed?", wait);
+    while (true) {
+        {
+            std::lock_guard<RAMCloud::SpinLock> lock{freeTxBufferMutex};
+            if (!freeTxBuffers.empty()) {
+                BufferDescriptor* bd = freeTxBuffers.back();
+                freeTxBuffers.pop_back();
+                return bd;
             }
         }
-    }
 
-    BufferDescriptor* bd = freeTxBuffers.back();
-    freeTxBuffers.pop_back();
-    return bd;
+        reapTxBuffers();
+    }
 }
 
 struct Chunk {
@@ -1206,15 +1207,134 @@ struct Chunk {
 };
 
 void
+sendStrictZeroCopy(Chunk* message,
+                   uint32_t chunkCount,
+                   uint32_t messageLen,
+                   QueuePair* qp)
+{
+    BufferDescriptor* bd = getTransmitBuffer();
+    bd->messageBytes = messageLen;
+
+    ibv_sge isge[MAX_TX_SGE_COUNT];
+
+    {
+        CycleCounter<> _{&threadMetrics.addingGECycles};
+        for (uint32_t i = 0 ; i < chunkCount; ++i) {
+            Chunk& chunk = message[i];
+#if 0
+            const uintptr_t addr = reinterpret_cast<const uintptr_t>(chunk.p);
+
+            // In-bounds.
+            assert(addr >= logMemoryBase &&
+                   (addr + chunk.len) <= (logMemoryBase + logMemoryBytes));
+            
+            // Still room.
+            assert(sgesUsed < MAX_TX_SGE_COUNT - 1 ||
+                              ((chunksUsed == (chunkCount -1)) &&
+                               (unaddedStart == unaddedEnd)));
+            // A long enough chunk to zero-copy.
+            assert(chunk.len > MIN_CHUNK_ZERO_COPY_LEN);
+#endif
+            isge[i] = {
+                reinterpret_cast<const uintptr_t>(chunk.p),
+                chunk.len,
+                logMemoryRegion->lkey
+            };
+        }
+    }
+
+    ibv_send_wr txWorkRequest;
+
+    {
+        CycleCounter<> _{&threadMetrics.setupWRCycles};
+        memset(&txWorkRequest, 0, sizeof(txWorkRequest));
+        txWorkRequest.wr_id = reinterpret_cast<uint64_t>(bd);// stash descriptor ptr
+        txWorkRequest.next = NULL;
+        txWorkRequest.sg_list = isge;
+        txWorkRequest.num_sge = chunkCount;
+        txWorkRequest.opcode = IBV_WR_SEND;
+        txWorkRequest.send_flags = IBV_SEND_SIGNALED;
+
+        // We can get a substantial latency improvement (nearly 2usec less per RTT)
+        // by inlining data with the WQE for small messages. The Verbs library
+        // automatically takes care of copying from the SGEs to the WQE.
+        if (messageLen <= MAX_INLINE_DATA)
+            txWorkRequest.send_flags |= IBV_SEND_INLINE;
+    }
+
+    threadMetrics.chunksTransmitted += chunkCount;
+    threadMetrics.chunksTransmittedZeroCopy += chunkCount;
+
+    CycleCounter<> postSendCtr{&threadMetrics.postSendCycles};
+    ibv_send_wr* badTxWorkRequest;
+    if (ibv_post_send(qp->qp, &txWorkRequest, &badTxWorkRequest)) {
+        DIE("ibv_post_send failed");
+    }
+}
+
+void
+sendStrictCopy(Chunk* message,
+               uint32_t chunkCount,
+               uint32_t messageLen,
+               QueuePair* qp)
+{
+    BufferDescriptor* bd = getTransmitBuffer();
+    bd->messageBytes = messageLen;
+
+    {
+        CycleCounter<> memcpyctr{&threadMetrics.memCpyCycles};
+        char* unaddedEnd = bd->buffer;
+        for (uint32_t i = 0; i < chunkCount; ++i) {
+            Chunk& chunk = message[i];
+            memcpy(unaddedEnd, chunk.p, chunk.len);
+            unaddedEnd += chunk.len;
+        }
+    }
+
+    ibv_sge isge = {
+        reinterpret_cast<uint64_t>(bd->buffer),
+        bd->messageBytes,
+        bd->mr->lkey
+    };
+
+    ibv_send_wr txWorkRequest;
+    {
+        CycleCounter<> _{&threadMetrics.setupWRCycles};
+        memset(&txWorkRequest, 0, sizeof(txWorkRequest));
+        txWorkRequest.wr_id = reinterpret_cast<uint64_t>(bd);// stash descriptor ptr
+        txWorkRequest.next = NULL;
+        txWorkRequest.sg_list = &isge;
+        txWorkRequest.num_sge = 1;
+        txWorkRequest.opcode = IBV_WR_SEND;
+        txWorkRequest.send_flags = IBV_SEND_SIGNALED;
+
+        // We can get a substantial latency improvement (nearly 2usec less per RTT)
+        // by inlining data with the WQE for small messages. The Verbs library
+        // automatically takes care of copying from the SGEs to the WQE.
+        if (messageLen <= MAX_INLINE_DATA)
+            txWorkRequest.send_flags |= IBV_SEND_INLINE;
+    }
+
+    threadMetrics.chunksTransmitted += chunkCount;
+
+    CycleCounter<> postSendCtr{&threadMetrics.postSendCycles};
+    ibv_send_wr* badTxWorkRequest;
+    if (ibv_post_send(qp->qp, &txWorkRequest, &badTxWorkRequest)) {
+        DIE("ibv_post_send failed");
+    }
+}
+
+void
 sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp, bool allowZeroCopy)
 {
-    uint32_t lastChunkIndex = chunkCount - 1;
-    ibv_sge isge[MAX_TX_SGE_COUNT];
+    BufferDescriptor* bd = getTransmitBuffer();
+    bd->messageBytes = messageLen;
 
     uint32_t chunksUsed = 0;
     uint32_t sgesUsed = 0;
-    BufferDescriptor* bd = getTransmitBuffer();
-    bd->messageBytes = messageLen;
+
+    uint32_t lastChunkIndex = chunkCount - 1;
+    ibv_sge isge[MAX_TX_SGE_COUNT];
 
     // The variables below allow us to collect several chunks from the
     // Buffer into a single sge in some situations. They describe a
@@ -1241,15 +1361,16 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
         //
         //   stutsman: hold back one SGE for any data copied to the tx buffer,
         //   *unless* this is the last chunk *and* the tx buffer is empty.
-        bool inBounds = addr >= logMemoryBase &&
+        const bool inBounds = addr >= logMemoryBase &&
             (addr + chunk.len) <= (logMemoryBase + logMemoryBytes);
-        bool stillRoom = (sgesUsed < MAX_TX_SGE_COUNT - 1 ||
+        const bool stillRoom = (sgesUsed < MAX_TX_SGE_COUNT - 1 ||
                           ((chunksUsed == lastChunkIndex) &&
                            (unaddedStart == unaddedEnd)));
-        bool enoughLen = chunk.len > MIN_CHUNK_ZERO_COPY_LEN;
+        const bool enoughLen = chunk.len > MIN_CHUNK_ZERO_COPY_LEN;
         
         if (allowZeroCopy && stillRoom && inBounds && enoughLen)
         {
+            CycleCounter<> _{&threadMetrics.addingGECycles};
             if (unaddedStart != unaddedEnd) {
                 isge[sgesUsed] = {
                     reinterpret_cast<uint64_t>(unaddedStart),
@@ -1269,8 +1390,11 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
             ++chunksZeroCopied;
         } else {
             if (allowZeroCopy){
-                DIE("FATAL ERROR: memcpying in zero copy mode. inBounds:%s stillRoom:%s enoughLen:%s",
-                inBounds?"true":"false",stillRoom?"true":"false",enoughLen?"true":"false");
+                DIE("FATAL ERROR: memcpying in zero copy mode. inBounds: %s "
+                    "stillRoom: %s enoughLen: %s",
+                    inBounds ? "true" : "false",
+                    stillRoom ? "true" : "false",
+                    enoughLen ? "true" : "false");
             }
             CycleCounter<> memcpyctr{&threadMetrics.memCpyCycles};
             memcpy(unaddedEnd, chunk.p, chunk.len);
@@ -1279,6 +1403,7 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
         ++chunksUsed;
     }
     if (unaddedStart != unaddedEnd) {
+        CycleCounter<> _{&threadMetrics.addingGECycles};
         isge[sgesUsed] = {
             reinterpret_cast<uint64_t>(unaddedStart),
             uint32_t(unaddedEnd - unaddedStart),
@@ -1290,19 +1415,22 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
 
     ibv_send_wr txWorkRequest;
 
-    memset(&txWorkRequest, 0, sizeof(txWorkRequest));
-    txWorkRequest.wr_id = reinterpret_cast<uint64_t>(bd);// stash descriptor ptr
-    txWorkRequest.next = NULL;
-    txWorkRequest.sg_list = isge;
-    txWorkRequest.num_sge = sgesUsed;
-    txWorkRequest.opcode = IBV_WR_SEND;
-    txWorkRequest.send_flags = IBV_SEND_SIGNALED;
+    {
+        CycleCounter<> _{&threadMetrics.setupWRCycles};
+        memset(&txWorkRequest, 0, sizeof(txWorkRequest));
+        txWorkRequest.wr_id = reinterpret_cast<uint64_t>(bd);// stash descriptor ptr
+        txWorkRequest.next = NULL;
+        txWorkRequest.sg_list = isge;
+        txWorkRequest.num_sge = sgesUsed;
+        txWorkRequest.opcode = IBV_WR_SEND;
+        txWorkRequest.send_flags = IBV_SEND_SIGNALED;
 
-    // We can get a substantial latency improvement (nearly 2usec less per RTT)
-    // by inlining data with the WQE for small messages. The Verbs library
-    // automatically takes care of copying from the SGEs to the WQE.
-    if (messageLen <= MAX_INLINE_DATA)
-        txWorkRequest.send_flags |= IBV_SEND_INLINE;
+        // We can get a substantial latency improvement (nearly 2usec less per RTT)
+        // by inlining data with the WQE for small messages. The Verbs library
+        // automatically takes care of copying from the SGEs to the WQE.
+        if (messageLen <= MAX_INLINE_DATA)
+            txWorkRequest.send_flags |= IBV_SEND_INLINE;
+    }
 
     threadMetrics.chunksTransmitted += chunksUsed;
     threadMetrics.chunksTransmittedZeroCopy += chunksZeroCopied;
@@ -1726,9 +1854,9 @@ class Benchmark {
 
         threadState->chunks.resize(nChunks);
         uint32_t start = 0;
-        for (size_t i = 0; i < nChunks; ++i) {
             start = generateRandom();
             start = start % (logSize - chunkSize);
+        for (size_t i = 0; i < nChunks; ++i) {
             threadState->chunks[i].p = (void*)(logMemoryBase + start);
             threadState->chunks[i].len = chunkSize;
         }
@@ -1750,19 +1878,36 @@ class Benchmark {
         threadMetrics.dump(!doZeroCopy, threadState->qp->getPeerName(),
                            cycles, nChunks, chunkSize, seconds, warmupSeconds);
 
-        LOG(ERROR, "Chunks tx zero-copy[%s]: %lu / %lu", threadState->qp->getPeerName(),
-                        threadMetrics.chunksTransmittedZeroCopy, threadMetrics.chunksTransmitted);
+        LOG(ERROR, "Chunks tx zero-copy[%s]: %lu / %lu",
+            threadState->qp->getPeerName(),
+            threadMetrics.chunksTransmittedZeroCopy,
+            threadMetrics.chunksTransmitted);
 
-        if (doZeroCopy && threadMetrics.chunksTransmittedZeroCopy != threadMetrics.chunksTransmitted)
+        if (doZeroCopy &&
+            threadMetrics.chunksTransmittedZeroCopy !=
+                threadMetrics.chunksTransmitted)
+        {
             DIE("Not all chunks were zero copied in zero copy mode");
+        }
     }
 
     void run(ThreadState* threadState, double seconds) {
         const uint64_t cyclesToRun = Cycles::fromSeconds(seconds);
         const uint64_t start = Cycles::rdtsc();
         while (true) {
-            sendZeroCopy(&threadState->chunks[0], nChunks, nChunks * chunkSize,
-                         threadState->qp.get(), doZeroCopy);
+            //sendZeroCopy(&threadState->chunks[0], nChunks, nChunks * chunkSize,
+            //             threadState->qp.get(), doZeroCopy);
+            if (doZeroCopy) {
+                sendStrictZeroCopy(&threadState->chunks[0],
+                                   nChunks,
+                                   nChunks * chunkSize,
+                                   threadState->qp.get());
+            } else {
+                sendStrictCopy(&threadState->chunks[0],
+                               nChunks,
+                               nChunks * chunkSize,
+                               threadState->qp.get());
+            }
             if (Cycles::rdtsc() - start > cyclesToRun)
                 break;
         }
@@ -1870,7 +2015,10 @@ int main(int argc, const char** argv)
 
         ThreadMetrics::dumpHeader();
 
-        for (size_t chunkSize=minChunkSize; chunkSize <= maxChunkSize; chunkSize*=2) {
+        for (size_t chunkSize = minChunkSize;
+             chunkSize <= maxChunkSize;
+             chunkSize *= 2)
+        {
             for (size_t nChunks = minChunksPerMessage;
                  nChunks <= maxChunksPerMessage && nChunks <= 32;
                  ++nChunks)

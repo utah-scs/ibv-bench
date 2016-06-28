@@ -3,3 +3,4 @@ browse.*
 .gitignore
 *.o
 ibv-bench
+*.pyc
