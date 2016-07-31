@@ -88,16 +88,20 @@ struct ThreadMetrics {
         , miscCycles{}
         , chunksTransmitted{}
         , chunksTransmittedZeroCopy{}
+        , transmissions{}
+        , transmittedBytes{}
     {}
 
     void reset() { new (this) ThreadMetrics{}; }
 
     static void dumpHeader() {
-        printf("copied server chunksPerMessage chunkSize seconds warmupSeconds "
+        printf("copied server chunksPerMessage chunkSize "
+                "deltasPerMessage deltaSize "
+                "seconds warmupSeconds "
                 "totalSecs totalNSecs "
                 "sendNSecs getTxNSecs memcpyNSecs addingGENSecs setupWRNSecs "
                 "miscCycles "
-                "chunksTx chunksTxZeroCopy mbs\n");
+                "chunksTx chunksTxZeroCopy transmissions transmittedBytes mbs\n");
     }
 
     void dump(bool copied,
@@ -105,16 +109,20 @@ struct ThreadMetrics {
               uint64_t cycles,
               int chunksPerMessage,
               size_t chunkSize,
+              int deltasPerMessage,
+              size_t deltaSize,
               double seconds,
               double warmupSeconds)
     {
         const double mbs =
             chunkSize * chunksTransmitted / seconds / (1024 * 1024);
-        printf("%d %s %d %lu %f %f %f %lu %lu %lu %lu %lu %lu %lu %lu %lu %f\n",
+        printf("%d %s %d %lu %d %lu %f %f %f %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %f\n",
                copied,
                server,
                chunksPerMessage,
                chunkSize,
+               deltasPerMessage,
+               deltaSize,
                seconds,
                warmupSeconds,
                Cycles::toSeconds(cycles),
@@ -127,6 +135,8 @@ struct ThreadMetrics {
                Cycles::toNanoseconds(miscCycles),
                chunksTransmitted,
                chunksTransmittedZeroCopy,
+               transmissions,
+               transmittedBytes,
                mbs);
         fflush(stdout);
     }
@@ -140,6 +150,8 @@ struct ThreadMetrics {
 
     uint64_t chunksTransmitted;
     uint64_t chunksTransmittedZeroCopy;
+    uint64_t transmissions;
+    uint64_t transmittedBytes;
 };
 
 thread_local ThreadMetrics threadMetrics{};
@@ -1264,6 +1276,8 @@ sendStrictZeroCopy(Chunk* message,
 
     threadMetrics.chunksTransmitted += chunkCount;
     threadMetrics.chunksTransmittedZeroCopy += chunkCount;
+    threadMetrics.transmittedBytes += messageLen;
+    ++threadMetrics.transmissions;
 
     CycleCounter<> postSendCtr{&threadMetrics.postSendCycles};
     ibv_send_wr* badTxWorkRequest;
@@ -1316,6 +1330,8 @@ sendStrictCopy(Chunk* message,
     }
 
     threadMetrics.chunksTransmitted += chunkCount;
+    threadMetrics.transmittedBytes += messageLen;
+    ++threadMetrics.transmissions;
 
     CycleCounter<> postSendCtr{&threadMetrics.postSendCycles};
     ibv_send_wr* badTxWorkRequest;
@@ -1434,6 +1450,8 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
 
     threadMetrics.chunksTransmitted += chunksUsed;
     threadMetrics.chunksTransmittedZeroCopy += chunksZeroCopied;
+    threadMetrics.transmittedBytes += messageLen;
+    ++threadMetrics.transmissions;
 
     ibv_send_wr* badTxWorkRequest;
     
@@ -1806,12 +1824,16 @@ class Benchmark {
     Benchmark(const std::vector<std::string>& servers,
               size_t nChunks,
               size_t chunkSize,
+              size_t nDeltas,
+              size_t deltaSize,
               bool doZeroCopy,
               double seconds,
               double warmupSeconds)
       : servers{servers}
       , nChunks{nChunks}
       , chunkSize{chunkSize}
+      , nDeltas{nDeltas}
+      , deltaSize{deltaSize}
       , doZeroCopy{doZeroCopy}
       , seconds{seconds}
       , warmupSeconds{warmupSeconds}
@@ -1848,15 +1870,25 @@ class Benchmark {
 
     void entry(size_t threadNum, ThreadState* threadState) {
         LOG(DEBUG, "Running benchmark with %lu clients %lu chunksPerMessage "
-                "%lu chunkSize", servers.size(), nChunks, chunkSize);
+                "%lu chunkSize %lu deltas %lu deltaSize",
+                servers.size(), nChunks, chunkSize,
+                nDeltas, deltaSize);
 
         pinTo(threadNum);
 
-        threadState->chunks.resize(nChunks);
+        threadState->chunks.resize(nDeltas + nChunks);
         uint32_t start = 0;
+
+        for (size_t i = 0; i < nDeltas; ++i) {
+            start = generateRandom();
+            start = start % (logSize - deltaSize);
+            threadState->chunks[i].p = (void*)(logMemoryBase + start);
+            threadState->chunks[i].len = deltaSize;
+        }
+
+        for (size_t i = 0; i < nChunks; ++i) {
             start = generateRandom();
             start = start % (logSize - chunkSize);
-        for (size_t i = 0; i < nChunks; ++i) {
             threadState->chunks[i].p = (void*)(logMemoryBase + start);
             threadState->chunks[i].len = chunkSize;
         }
@@ -1876,7 +1908,8 @@ class Benchmark {
         }
 
         threadMetrics.dump(!doZeroCopy, threadState->qp->getPeerName(),
-                           cycles, nChunks, chunkSize, seconds, warmupSeconds);
+                           cycles, nChunks, chunkSize, nDeltas, deltaSize,
+                           seconds, warmupSeconds);
 
         LOG(ERROR, "Chunks tx zero-copy[%s]: %lu / %lu",
             threadState->qp->getPeerName(),
@@ -1899,13 +1932,13 @@ class Benchmark {
             //             threadState->qp.get(), doZeroCopy);
             if (doZeroCopy) {
                 sendStrictZeroCopy(&threadState->chunks[0],
-                                   nChunks,
-                                   nChunks * chunkSize,
+                                   nDeltas + nChunks,
+                                   nDeltas * deltaSize + nChunks * chunkSize,
                                    threadState->qp.get());
             } else {
                 sendStrictCopy(&threadState->chunks[0],
-                               nChunks,
-                               nChunks * chunkSize,
+                               nDeltas + nChunks,
+                               nDeltas * deltaSize + nChunks * chunkSize,
                                threadState->qp.get());
             }
             if (Cycles::rdtsc() - start > cyclesToRun)
@@ -1918,6 +1951,10 @@ class Benchmark {
 
     const size_t nChunks;
     const size_t chunkSize;
+
+    const size_t nDeltas;
+    const size_t deltaSize;
+
     const bool doZeroCopy;
 
     const double seconds;
@@ -1976,7 +2013,7 @@ int main(int argc, const char** argv)
 
     assert(minChunkSize > 0);
     assert(maxChunkSize <= 1024);
-    assert(minChunksPerMessage > 0);
+    assert(minChunksPerMessage >= 0);
     assert(maxChunksPerMessage <= 1024);
     assert(seconds > 0.);
     assert(warmupSeconds >= 0.);
@@ -1995,7 +2032,7 @@ int main(int argc, const char** argv)
 
     Tub<LargeBlockOfMemory<>> largeBlockOfMemory{};
     if (useHugePages) {
-        largeBlockOfMemory.construct(logSize);
+        largeBlockOfMemory.construct("/dev/hugetlbfs/ibv-bench-log", logSize);
         base = largeBlockOfMemory->get();
     } else {
         base = xmemalign(4096, logSize);
@@ -2015,9 +2052,11 @@ int main(int argc, const char** argv)
 
         ThreadMetrics::dumpHeader();
 
-        for (size_t chunkSize = minChunkSize;
-             chunkSize <= maxChunkSize;
-             chunkSize *= 2)
+        //for (size_t chunkSize = minChunkSize;
+        //     chunkSize <= maxChunkSize;
+        //     chunkSize *= 2)
+        const std::vector<size_t> sizes{128, 1024};
+        for (size_t chunkSize : sizes)
         {
             for (size_t nChunks = minChunksPerMessage;
                  nChunks <= maxChunksPerMessage && nChunks <= 32;
@@ -2026,14 +2065,14 @@ int main(int argc, const char** argv)
                 {
                     LOG(INFO, "Running Zero Copy on #chunks: %lu size: %lu",
                             nChunks, chunkSize);
-                    Benchmark bench{hostNames, nChunks, chunkSize,
+                    Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
                                     true /* 0-copy */, seconds, warmupSeconds};
                     bench.start();
                 }
                 {
                     LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
                             nChunks, chunkSize);
-                    Benchmark bench{hostNames, nChunks, chunkSize,
+                    Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
                                     false /* no 0-copy */, seconds, warmupSeconds};
                     bench.start();
                 }
@@ -2042,9 +2081,27 @@ int main(int argc, const char** argv)
             for (size_t nChunks = 64; nChunks <= maxChunksPerMessage; nChunks *=2) {
                 LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
                         nChunks, chunkSize);
-                Benchmark bench{hostNames, nChunks, chunkSize,
+                Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
                                 false /* doZeroCopy */, seconds, warmupSeconds};
                 bench.start();
+            }
+        }
+
+        // Delta record tests. For these we use the command line args for
+        // number of chunks for the deltas instead, and we just included a 16
+        // KB base page in each trasmission no matter what.  It's all zero-copy
+        // too.
+        for (size_t deltaSize : sizes)
+        {
+            for (size_t nDeltas = 0; nDeltas <= 31; ++nDeltas)
+            {
+                {
+                    LOG(INFO, "Running Deltas on #deltas: %lu size: %lu",
+                            nDeltas, deltaSize);
+                    Benchmark bench{hostNames, 1, 16384, nDeltas, deltaSize,
+                                    true /* 0-copy */, seconds, warmupSeconds};
+                    bench.start();
+                }
             }
         }
     }

@@ -1,0 +1,6 @@
+#!/bin/bash
+
+awk '/hugepage/ { print; next } /\W+kernel\W+\/boot/ { print $0 " hugepagesz=1GB hugepages=4 "; next } { print }' /boot/grub/grub.conf > /boot/grub/grub-hugepages.conf
+
+cp /boot/grub/grub.conf /boot/grub/grub-normal.conf
+cp /boot/grub/grub-hugepages.conf /boot/grub/grub.conf

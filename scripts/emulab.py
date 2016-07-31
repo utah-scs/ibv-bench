@@ -81,13 +81,15 @@ class BenchmarkRunner(object):
             print >> f, 'Run on: %s' % ' '.join(self.with_fqdn(self.host_names))
             print >> f, self.end_time.strftime('Experiment completed at %d/%m/%y %H:%M:%S')
             print >> f, 'Experiment run time: %s' % str(self.end_time - self.start_time)
-        subprocess.check_call("rsync -ave ssh %s:~/ibv-bench/%s*.log %s/" %
+        subprocess.call("rsync -ave ssh %s:~/ibv-bench/%s*.log %s/" %
                 (self.host_names[0], self.get_name(), log_dir),
                 shell=True, stdout=sys.stdout)
 
         try:
             out = os.path.join('logs', 'latest', 'out')
             os.symlink('%s-out.log' % self.get_name(), out)
+            err = os.path.join('logs', 'latest', 'err')
+            os.symlink('%s-err.log' % self.get_name(), err)
         except:
             pass
 
@@ -114,11 +116,47 @@ class BenchmarkRunner(object):
         for host in self.host_names:
             ssh(host, 'pkill -9 ibv-bench', checked=False)
 
+    def update_limits(self, server):
+        ssh(server, 'sudo ~/ibv-bench/scripts/disable-pin-limits')
+
+    def check_huge_pages(self, server):
+        r = ssh(server, '~/ibv-bench/scripts/check-hugepages', checked=False)
+        return r == 0
+
+    def enable_huge_pages(self, server):
+        """Notice: this modifies grub.conf to update bootparams and then
+        reboots the machine, so this script needs to be restarted if
+        this is used.
+        """
+        ssh(server, 'sudo ~/ibv-bench/scripts/enable-hugepages')
+        ssh(server, 'sudo reboot')
+
+    def mount_huge_pages(self, server):
+        ssh(server, 'sudo ~/ibv-bench/scripts/mount-hugepages')
+
     def run(self):
         try:
             for host in self.host_names:
                 print 'Sending code to %s' % host
                 self.send_code(host)
+
+            some_rebooting = False
+            for host in self.host_names:
+                print 'Checking that hugepages are enabled on %s' % host
+                r = self.check_huge_pages(host)
+                if not r:
+                    print 'Enabling hugepages on %s' % host
+                    self.enable_huge_pages(host)
+                    some_rebooting = True
+            if some_rebooting:
+                raise SystemExit(
+                    "Some machines rebooting to enable hugepages; " +
+                    "restart this script when all machines are back online")
+
+            for host in self.host_names:
+                print 'Fixing pinning limits and mounting hugetlbfs %s' % host
+                self.update_limits(host)
+                self.mount_huge_pages(host)
 
             for host in self.host_names:
                 print 'Compiling code on %s' % host
