@@ -8,5 +8,5 @@ fi
 umount /dev/hugetlbfs > /dev/null
 mkdir -p /dev/hugetlbfs
 chmod 777 /dev/hugetlbfs
-mount -t hugetlbfs none /dev/hugetlbfs -o pagesize=1G,size=4G,nr_inodes=1
+mount -t hugetlbfs none /dev/hugetlbfs -o pagesize=1G,size=4G
 chmod 777 /dev/hugetlbfs
