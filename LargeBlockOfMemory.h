@@ -18,6 +18,7 @@
 
 #include <cinttypes>
 #include <string>
+#include <cstring>
 
 #include <limits.h>
 #include <sys/file.h>
@@ -53,9 +54,9 @@ struct LargeBlockOfMemory {
      * \throw FatalError
      *      If the memory could not be allocated.
      */
-    explicit LargeBlockOfMemory(size_t length)
+    explicit LargeBlockOfMemory(size_t length, int extraFlags = 0)
         : length(length)
-        , block(static_cast<T*>(mmapGigabyteAligned(length, MAP_ANONYMOUS)))
+        , block(static_cast<T*>(mmapGigabyteAligned(length, MAP_ANONYMOUS | extraFlags)))
     {
         if (block == MAP_FAILED) {
             if (length == 0)
@@ -88,7 +89,7 @@ struct LargeBlockOfMemory {
         // exist, as we don't want to stomp on other processes.
         int fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
         if (fd == -1) {
-            DIE("Could not open file [%s]", path);
+            DIE("Could not open file [%s]: %s", path, strerror(errno));
         }
 
         // This isn't strictly necessary for hugetblfs, but it lets us

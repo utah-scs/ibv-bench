@@ -1,0 +1,11 @@
+#!/bin/bash
+
+grep '\* soft memlock unlimited' /etc/security/limits.conf > /dev/null
+if [[ "$?" != "0" ]]; then
+    echo '* soft memlock unlimited' >> /etc/security/limits.conf
+fi
+
+grep '\* hard memlock unlimited' /etc/security/limits.conf > /dev/null
+if [[ "$?" != "0" ]]; then
+    echo '* hard memlock unlimited' >> /etc/security/limits.conf
+fi

@@ -1,2 +1,6 @@
+.idea/
+browse.*
+.gitignore
 *.o
 ibv-bench
+*.pyc

@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <cinttypes>
 #include <cassert>
+#include <deque>
+#include <atomic>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -14,24 +16,23 @@
 #include <netdb.h>
 #include <sys/socket.h>
 
-#include <vector>
-#include <string>
 #include <thread>
+#include <mutex>
 #include <iostream>
 #include <map>
+#include <algorithm>
 
 #include "docopt.h"
 
-#include "Common.h"
 #include "Tub.h"
 #include "IpAddress.h"
 #include "LargeBlockOfMemory.h"
-#include "Cycles.h"
 #include "CycleCounter.h"
+#include "SpinLock.h"
 
 static const int PORT = 12240;
 
-static const uint32_t MAX_INLINE_DATA = 400;
+static const uint32_t MAX_INLINE_DATA = 0;
 static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 32;
 
 // Since we always use at most 1 SGE per receive request, there is no need
@@ -40,13 +41,13 @@ static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 32;
 // Infiniband controller needs to fetch more data from host memory,
 // which results in a higher number of on-controller cache misses.
 static const uint32_t MAX_SHARED_RX_SGE_COUNT = 1;
-static const uint32_t MAX_TX_QUEUE_DEPTH = 16;
+static const uint32_t MAX_TX_QUEUE_DEPTH = 128;
 
 // With 64 KB seglets 1 MB is fractured into 16 or 17 pieces, plus we
 // need an entry for the headers.
 // 31 seems to be the limit on this. Not sure why, because the qp's are
 // initialized with a max sge limit of 1 anyway.
-uint32_t MAX_TX_SGE_COUNT = 26;
+const uint32_t MAX_TX_SGE_COUNT = 32;
 const uint32_t MIN_CHUNK_ZERO_COPY_LEN = 0;
 
 static const uint32_t QP_EXCHANGE_MAX_TIMEOUTS = 10;
@@ -75,6 +76,86 @@ int          serverSetupSocket; // UDP socket for incoming setup requests;
 int          clientSetupSocket; // UDP socket for outgoing setup requests
 int          clientPort;        // Port number associated with
 
+static const size_t logSize = 4lu * 1024 * 1024 * 1024;
+
+struct ThreadMetrics {
+    ThreadMetrics()
+        : postSendCycles{}
+        , getTransmitCycles{}
+        , memCpyCycles{}
+        , addingGECycles{}
+        , setupWRCycles{}
+        , miscCycles{}
+        , chunksTransmitted{}
+        , chunksTransmittedZeroCopy{}
+        , transmissions{}
+        , transmittedBytes{}
+    {}
+
+    void reset() { new (this) ThreadMetrics{}; }
+
+    static void dumpHeader() {
+        printf("copied server chunksPerMessage chunkSize "
+                "deltasPerMessage deltaSize "
+                "seconds warmupSeconds "
+                "totalSecs totalNSecs "
+                "sendNSecs getTxNSecs memcpyNSecs addingGENSecs setupWRNSecs "
+                "miscCycles "
+                "chunksTx chunksTxZeroCopy transmissions transmittedBytes mbs\n");
+    }
+
+    void dump(bool copied,
+              const char* server,
+              uint64_t cycles,
+              int chunksPerMessage,
+              size_t chunkSize,
+              int deltasPerMessage,
+              size_t deltaSize,
+              double seconds,
+              double warmupSeconds)
+    {
+        const double mbs =
+            chunkSize * chunksTransmitted / seconds / (1024 * 1024);
+        printf("%d %s %d %lu %d %lu %f %f %f %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %f\n",
+               copied,
+               server,
+               chunksPerMessage,
+               chunkSize,
+               deltasPerMessage,
+               deltaSize,
+               seconds,
+               warmupSeconds,
+               Cycles::toSeconds(cycles),
+               Cycles::toNanoseconds(cycles),
+               Cycles::toNanoseconds(postSendCycles),
+               Cycles::toNanoseconds(getTransmitCycles),
+               Cycles::toNanoseconds(memCpyCycles),
+               Cycles::toNanoseconds(addingGECycles),
+               Cycles::toNanoseconds(setupWRCycles),
+               Cycles::toNanoseconds(miscCycles),
+               chunksTransmitted,
+               chunksTransmittedZeroCopy,
+               transmissions,
+               transmittedBytes,
+               mbs);
+        fflush(stdout);
+    }
+
+    uint64_t postSendCycles;     // Cycles for post send calls per client;
+    uint64_t getTransmitCycles;  // Cycles for getting transmit buffers per client;
+    uint64_t memCpyCycles;       // Cycles for mem copying objects in copied=1 mode;
+    uint64_t addingGECycles;     // Cycles adding gather list entries for zero-copy;
+    uint64_t setupWRCycles;      // Cycles to create the WR sent to post_send;
+    uint64_t miscCycles;         // Cycle counter for perf debugging.
+
+    uint64_t chunksTransmitted;
+    uint64_t chunksTransmittedZeroCopy;
+    uint64_t transmissions;
+    uint64_t transmittedBytes;
+};
+
+thread_local ThreadMetrics threadMetrics{};
+
 ibv_context* ctxt;           // device context of the HCA to use
 ibv_pd* pd;
 
@@ -97,6 +178,7 @@ void* txBase;
 BufferDescriptor txDescriptors[MAX_TX_QUEUE_DEPTH];
 
 std::vector<BufferDescriptor*> freeTxBuffers{};
+RAMCloud::SpinLock freeTxBufferMutex("freeTxBuffers");
 
 uintptr_t logMemoryBase = 0;
 size_t logMemoryBytes = 0;
@@ -220,7 +302,7 @@ class QueuePair {
  *
  * Somewhat confusingly, each communicating end has a QueuePair, which are
  * bound (one might say "paired", but that's even more confusing). This
- * object is somewhat analogous to a TCB in TCP. 
+ * object is somewhat analogous to a TCB in TCP.
  *
  * After this method completes, the QueuePair will be in the INIT state.
  * A later call to #plumb() will transition it into the RTS state for
@@ -252,7 +334,7 @@ class QueuePair {
  *      Maximum number of outstanding receive work requests allowed on
  *      this QueuePair.
  * \param QKey
- *      UD Queue Pairs only. The QKey for this pair. 
+ *      UD Queue Pairs only. The QKey for this pair.
  */
 QueuePair::QueuePair(ibv_qp_type type,
     ibv_srq *srq, ibv_cq *txcq, ibv_cq *rxcq,
@@ -454,7 +536,7 @@ QueuePair::activate()
 /**
  * Get the initial packet sequence number for this QueuePair.
  * This is randomly generated on creation. It should not be confused
- * with the remote side's PSN, which is set in #plumb(). 
+ * with the remote side's PSN, which is set in #plumb().
  */
 uint32_t
 QueuePair::getInitialPsn() const
@@ -779,6 +861,7 @@ postSrqReceive(ibv_srq* srq, BufferDescriptor *bd)
     rxWorkRequest.num_sge = 1;
 
     ibv_recv_wr *badWorkRequest;
+
     int ret = ibv_post_srq_recv(srq, &rxWorkRequest, &badWorkRequest);
     if (ret) {
         DIE("Failure on ibv_post_srq_recv %d", ret);
@@ -789,7 +872,6 @@ void
 postSrqReceiveAndKickTransmit(ibv_srq* srq, BufferDescriptor *bd)
 {
     postSrqReceive(srq, bd);
-
 // XXX
 #if 0
     // This condition is hacky. One idea is to wrap ibv_srq in an
@@ -896,30 +978,14 @@ pollSocket()
         handleFileEvent();
         sleep(1);
     }
-    /*
-    fd_set rfds;
 
-    FD_ZERO(&rfds);
-    FD_SET(serverSetupSocket, &rfds);
-
-    timeval tv{};
-
-    while (true) {
-        tv.tv_sec = 1;
-        int r = select(1, &rfds, NULL, NULL, &tv);
-        if (r == -1) {
-            DIE("Error on select");
-        } else if (r > 0) {
-            LOG(NOTICE, "Handling a socket event");
-            handleFileEvent();
-        } else {
-            LOG(NOTICE, "select timed out");
-        }
-    }
-    */
 }
 
-bool setup(bool isServer, const char* hostName)
+/**
+ * \param hostName
+ *      nullptr for clients or the hostname to listen for incoming QP reqs on.
+ */
+bool setup(const char* hostName)
 {
     clientSetupSocket = socket(PF_INET, SOCK_DGRAM, 0);
     if (clientSetupSocket == -1) {
@@ -931,11 +997,11 @@ bool setup(bool isServer, const char* hostName)
     socketAddress.sin_addr.s_addr = htonl(INADDR_ANY);
     socketAddress.sin_port = 0;
     if (bind(clientSetupSocket,
-            (sockaddr*)(&socketAddress),
-            sizeof(socketAddress)) == -1) {
+             (sockaddr * )(&socketAddress),
+             sizeof(socketAddress)) == -1) {
         close(clientSetupSocket);
         LOG(WARNING, "couldn't bind port for clientSetupSocket: %s",
-                strerror(errno));
+            strerror(errno));
         exit(-1);
     }
 
@@ -946,17 +1012,17 @@ bool setup(bool isServer, const char* hostName)
 
     socklen_t socketAddressLength = sizeof(socketAddress);
     if (getsockname(clientSetupSocket,
-            (sockaddr*)(&socketAddress),
-            &socketAddressLength) != 0) {
+                    (sockaddr * )(&socketAddress),
+                    &socketAddressLength) != 0) {
         close(clientSetupSocket);
         LOG(ERROR, "couldn't get port for clientSetupSocket: %s",
-                strerror(errno));
+            strerror(errno));
         exit(-1);
     }
     clientPort = ntohs(socketAddress.sin_port);
 
     // If this is a server, create a server setup socket and bind it.
-    if (isServer) {
+    if (hostName) {
         sockaddr address;
         getIpAddress(hostName, PORT, &address);
 
@@ -970,7 +1036,7 @@ bool setup(bool isServer, const char* hostName)
             close(serverSetupSocket);
             serverSetupSocket = -1;
             DIE("failed to bind socket for port %d: %s",
-                    PORT, strerror(errno));
+                PORT, strerror(errno));
         }
 
         if (!setNonBlocking(serverSetupSocket)) {
@@ -984,6 +1050,12 @@ bool setup(bool isServer, const char* hostName)
         std::thread t{pollSocket};
         t.detach();
     }
+    if (!devSetup())
+        DIE("Couldn't setup the Infiniband device");
+
+
+    // create completion queues for server receive, client receive, and
+    // server/client transmit
 
     if (!devSetup())
         DIE("Couldn't setup the Infiniband device");
@@ -1017,15 +1089,15 @@ bool setup(bool isServer, const char* hostName)
     // but it will work for now.
     uint32_t bufferSize = ((1u << 23) + 4095) & ~0xfff;
 
-    createBuffers(&rxBase, rxDescriptors, bufferSize, 
+    createBuffers(&rxBase, rxDescriptors, bufferSize,
                   uint32_t(MAX_SHARED_RX_QUEUE_DEPTH * 2));
-    uint32_t i = 0;
+    uint32_t j = 0;
     for (auto& bd : rxDescriptors) {
-        if (i < MAX_SHARED_RX_QUEUE_DEPTH)
+        if (j < MAX_SHARED_RX_QUEUE_DEPTH)
             postSrqReceiveAndKickTransmit(serverSrq, &bd);
         else
             postSrqReceiveAndKickTransmit(clientSrq, &bd);
-        ++i;
+        ++j;
     }
     //assert(numUsedClientSrqBuffers == 0);
 
@@ -1037,22 +1109,26 @@ bool setup(bool isServer, const char* hostName)
     // create completion queues for server receive, client receive, and
     // server/client transmit
     serverRxCq =
-        ibv_create_cq(ctxt, MAX_SHARED_RX_QUEUE_DEPTH, NULL, NULL, 0);
+            ibv_create_cq(ctxt, MAX_SHARED_RX_QUEUE_DEPTH, NULL, NULL, 0);
     check_error_null(serverRxCq,
                      "failed to create server receive completion queue");
 
     clientRxCq =
-        ibv_create_cq(ctxt, MAX_SHARED_RX_QUEUE_DEPTH, NULL, NULL, 0);
+            ibv_create_cq(ctxt, MAX_SHARED_RX_QUEUE_DEPTH, NULL, NULL, 0);
     check_error_null(clientRxCq,
                      "failed to create client receive completion queue");
 
     commonTxCq =
-        ibv_create_cq(ctxt, MAX_TX_QUEUE_DEPTH, NULL, NULL, 0);
+            ibv_create_cq(ctxt, MAX_TX_QUEUE_DEPTH, NULL, NULL, 0);
     check_error_null(commonTxCq,
                      "failed to create transmit completion queue");
 
+
     return true;
+
 }
+
+
 
 const char*
 wcStatusToString(int status)
@@ -1095,6 +1171,7 @@ reapTxBuffers()
     ibv_wc retArray[MAX_TX_QUEUE_DEPTH];
     int n = ibv_poll_cq(commonTxCq, MAX_TX_QUEUE_DEPTH, retArray);
 
+    std::lock_guard<RAMCloud::SpinLock> lock{freeTxBufferMutex};
     for (int i = 0; i < n; i++) {
         BufferDescriptor* bd =
             reinterpret_cast<BufferDescriptor*>(retArray[i].wr_id);
@@ -1108,6 +1185,10 @@ reapTxBuffers()
                 reinterpret_cast<uint64_t>(bd),
                 wcStatusToString(retArray[i].status));
             ++txFailures;
+            if (txFailures>=10000){
+                txFailures=0;
+                DIE("10K or more TxFailures occured. Exiting");
+            }
         }
     }
 
@@ -1117,29 +1198,19 @@ reapTxBuffers()
 BufferDescriptor*
 getTransmitBuffer()
 {
-    // if we've drained our free tx buffer pool, we must wait.
-    while (freeTxBuffers.empty()) {
-        reapTxBuffers();
-
-        if (freeTxBuffers.empty()) {
-            // We are temporarily out of buffers. Time how long it takes
-            // before a transmit buffer becomes available again (a long
-            // time could indicate deadlock); in the normal case this code
-            // is not invoked.
-            uint64_t start = rdtsc();
-            while (freeTxBuffers.empty())
-                reapTxBuffers();
-            uint64_t wait = rdtsc() - start;
-            if (wait > 3lu * 5 * 1000 * 1000)  {
-                LOG(WARNING, "Long delay waiting for transmit buffers "
-                        "(%lu ticks); deadlock or target crashed?", wait);
+    CycleCounter<> transmitCounter{&threadMetrics.getTransmitCycles};
+    while (true) {
+        {
+            std::lock_guard<RAMCloud::SpinLock> lock{freeTxBufferMutex};
+            if (!freeTxBuffers.empty()) {
+                BufferDescriptor* bd = freeTxBuffers.back();
+                freeTxBuffers.pop_back();
+                return bd;
             }
         }
-    }
 
-    BufferDescriptor* bd = freeTxBuffers.back();
-    freeTxBuffers.pop_back();
-    return bd;
+        reapTxBuffers();
+    }
 }
 
 struct Chunk {
@@ -1147,20 +1218,139 @@ struct Chunk {
     uint32_t len;
 };
 
-int chunksTransmitted = 0;
-int chunksTransmittedZeroCopy = 0;
+void
+sendStrictZeroCopy(Chunk* message,
+                   uint32_t chunkCount,
+                   uint32_t messageLen,
+                   QueuePair* qp)
+{
+    BufferDescriptor* bd = getTransmitBuffer();
+    bd->messageBytes = messageLen;
+
+    ibv_sge isge[MAX_TX_SGE_COUNT];
+
+    {
+        CycleCounter<> _{&threadMetrics.addingGECycles};
+        for (uint32_t i = 0 ; i < chunkCount; ++i) {
+            Chunk& chunk = message[i];
+#if 0
+            const uintptr_t addr = reinterpret_cast<const uintptr_t>(chunk.p);
+
+            // In-bounds.
+            assert(addr >= logMemoryBase &&
+                   (addr + chunk.len) <= (logMemoryBase + logMemoryBytes));
+            
+            // Still room.
+            assert(sgesUsed < MAX_TX_SGE_COUNT - 1 ||
+                              ((chunksUsed == (chunkCount -1)) &&
+                               (unaddedStart == unaddedEnd)));
+            // A long enough chunk to zero-copy.
+            assert(chunk.len > MIN_CHUNK_ZERO_COPY_LEN);
+#endif
+            isge[i] = {
+                reinterpret_cast<const uintptr_t>(chunk.p),
+                chunk.len,
+                logMemoryRegion->lkey
+            };
+        }
+    }
+
+    ibv_send_wr txWorkRequest;
+
+    {
+        CycleCounter<> _{&threadMetrics.setupWRCycles};
+        memset(&txWorkRequest, 0, sizeof(txWorkRequest));
+        txWorkRequest.wr_id = reinterpret_cast<uint64_t>(bd);// stash descriptor ptr
+        txWorkRequest.next = NULL;
+        txWorkRequest.sg_list = isge;
+        txWorkRequest.num_sge = chunkCount;
+        txWorkRequest.opcode = IBV_WR_SEND;
+        txWorkRequest.send_flags = IBV_SEND_SIGNALED;
+
+        // We can get a substantial latency improvement (nearly 2usec less per RTT)
+        // by inlining data with the WQE for small messages. The Verbs library
+        // automatically takes care of copying from the SGEs to the WQE.
+        if (messageLen <= MAX_INLINE_DATA)
+            txWorkRequest.send_flags |= IBV_SEND_INLINE;
+    }
+
+    threadMetrics.chunksTransmitted += chunkCount;
+    threadMetrics.chunksTransmittedZeroCopy += chunkCount;
+    threadMetrics.transmittedBytes += messageLen;
+    ++threadMetrics.transmissions;
+
+    CycleCounter<> postSendCtr{&threadMetrics.postSendCycles};
+    ibv_send_wr* badTxWorkRequest;
+    if (ibv_post_send(qp->qp, &txWorkRequest, &badTxWorkRequest)) {
+        DIE("ibv_post_send failed");
+    }
+}
 
 void
-sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp)
+sendStrictCopy(Chunk* message,
+               uint32_t chunkCount,
+               uint32_t messageLen,
+               QueuePair* qp)
 {
-    const bool allowZeroCopy = true;
-    uint32_t lastChunkIndex = chunkCount - 1;
-    ibv_sge isge[MAX_TX_SGE_COUNT];
+    BufferDescriptor* bd = getTransmitBuffer();
+    bd->messageBytes = messageLen;
+
+    {
+        CycleCounter<> memcpyctr{&threadMetrics.memCpyCycles};
+        char* unaddedEnd = bd->buffer;
+        for (uint32_t i = 0; i < chunkCount; ++i) {
+            Chunk& chunk = message[i];
+            memcpy(unaddedEnd, chunk.p, chunk.len);
+            unaddedEnd += chunk.len;
+        }
+    }
+
+    ibv_sge isge = {
+        reinterpret_cast<uint64_t>(bd->buffer),
+        bd->messageBytes,
+        bd->mr->lkey
+    };
+
+    ibv_send_wr txWorkRequest;
+    {
+        CycleCounter<> _{&threadMetrics.setupWRCycles};
+        memset(&txWorkRequest, 0, sizeof(txWorkRequest));
+        txWorkRequest.wr_id = reinterpret_cast<uint64_t>(bd);// stash descriptor ptr
+        txWorkRequest.next = NULL;
+        txWorkRequest.sg_list = &isge;
+        txWorkRequest.num_sge = 1;
+        txWorkRequest.opcode = IBV_WR_SEND;
+        txWorkRequest.send_flags = IBV_SEND_SIGNALED;
+
+        // We can get a substantial latency improvement (nearly 2usec less per RTT)
+        // by inlining data with the WQE for small messages. The Verbs library
+        // automatically takes care of copying from the SGEs to the WQE.
+        if (messageLen <= MAX_INLINE_DATA)
+            txWorkRequest.send_flags |= IBV_SEND_INLINE;
+    }
+
+    threadMetrics.chunksTransmitted += chunkCount;
+    threadMetrics.transmittedBytes += messageLen;
+    ++threadMetrics.transmissions;
+
+    CycleCounter<> postSendCtr{&threadMetrics.postSendCycles};
+    ibv_send_wr* badTxWorkRequest;
+    if (ibv_post_send(qp->qp, &txWorkRequest, &badTxWorkRequest)) {
+        DIE("ibv_post_send failed");
+    }
+}
+
+void
+sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp, bool allowZeroCopy)
+{
+    BufferDescriptor* bd = getTransmitBuffer();
+    bd->messageBytes = messageLen;
 
     uint32_t chunksUsed = 0;
     uint32_t sgesUsed = 0;
-    BufferDescriptor* bd = getTransmitBuffer();
-    bd->messageBytes = messageLen;
+
+    uint32_t lastChunkIndex = chunkCount - 1;
+    ibv_sge isge[MAX_TX_SGE_COUNT];
 
     // The variables below allow us to collect several chunks from the
     // Buffer into a single sge in some situations. They describe a
@@ -1187,14 +1377,16 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
         //
         //   stutsman: hold back one SGE for any data copied to the tx buffer,
         //   *unless* this is the last chunk *and* the tx buffer is empty.
-        bool inBounds = addr >= logMemoryBase &&
+        const bool inBounds = addr >= logMemoryBase &&
             (addr + chunk.len) <= (logMemoryBase + logMemoryBytes);
-        bool stillRoom = (sgesUsed < MAX_TX_SGE_COUNT - 1 ||
+        const bool stillRoom = (sgesUsed < MAX_TX_SGE_COUNT - 1 ||
                           ((chunksUsed == lastChunkIndex) &&
                            (unaddedStart == unaddedEnd)));
-        if (allowZeroCopy && stillRoom && inBounds &&
-            chunk.len > MIN_CHUNK_ZERO_COPY_LEN)
+        const bool enoughLen = chunk.len > MIN_CHUNK_ZERO_COPY_LEN;
+        
+        if (allowZeroCopy && stillRoom && inBounds && enoughLen)
         {
+            CycleCounter<> _{&threadMetrics.addingGECycles};
             if (unaddedStart != unaddedEnd) {
                 isge[sgesUsed] = {
                     reinterpret_cast<uint64_t>(unaddedStart),
@@ -1213,12 +1405,21 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
             ++sgesUsed;
             ++chunksZeroCopied;
         } else {
+            if (allowZeroCopy){
+                DIE("FATAL ERROR: memcpying in zero copy mode. inBounds: %s "
+                    "stillRoom: %s enoughLen: %s",
+                    inBounds ? "true" : "false",
+                    stillRoom ? "true" : "false",
+                    enoughLen ? "true" : "false");
+            }
+            CycleCounter<> memcpyctr{&threadMetrics.memCpyCycles};
             memcpy(unaddedEnd, chunk.p, chunk.len);
             unaddedEnd += chunk.len;
         }
         ++chunksUsed;
     }
     if (unaddedStart != unaddedEnd) {
+        CycleCounter<> _{&threadMetrics.addingGECycles};
         isge[sgesUsed] = {
             reinterpret_cast<uint64_t>(unaddedStart),
             uint32_t(unaddedEnd - unaddedStart),
@@ -1230,24 +1431,31 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
 
     ibv_send_wr txWorkRequest;
 
-    memset(&txWorkRequest, 0, sizeof(txWorkRequest));
-    txWorkRequest.wr_id = reinterpret_cast<uint64_t>(bd);// stash descriptor ptr
-    txWorkRequest.next = NULL;
-    txWorkRequest.sg_list = isge;
-    txWorkRequest.num_sge = sgesUsed;
-    txWorkRequest.opcode = IBV_WR_SEND;
-    txWorkRequest.send_flags = IBV_SEND_SIGNALED;
+    {
+        CycleCounter<> _{&threadMetrics.setupWRCycles};
+        memset(&txWorkRequest, 0, sizeof(txWorkRequest));
+        txWorkRequest.wr_id = reinterpret_cast<uint64_t>(bd);// stash descriptor ptr
+        txWorkRequest.next = NULL;
+        txWorkRequest.sg_list = isge;
+        txWorkRequest.num_sge = sgesUsed;
+        txWorkRequest.opcode = IBV_WR_SEND;
+        txWorkRequest.send_flags = IBV_SEND_SIGNALED;
 
-    // We can get a substantial latency improvement (nearly 2usec less per RTT)
-    // by inlining data with the WQE for small messages. The Verbs library
-    // automatically takes care of copying from the SGEs to the WQE.
-    if (messageLen <= MAX_INLINE_DATA)
-        txWorkRequest.send_flags |= IBV_SEND_INLINE;
+        // We can get a substantial latency improvement (nearly 2usec less per RTT)
+        // by inlining data with the WQE for small messages. The Verbs library
+        // automatically takes care of copying from the SGEs to the WQE.
+        if (messageLen <= MAX_INLINE_DATA)
+            txWorkRequest.send_flags |= IBV_SEND_INLINE;
+    }
 
-    chunksTransmitted += chunksUsed;
-    chunksTransmittedZeroCopy += chunksZeroCopied;
+    threadMetrics.chunksTransmitted += chunksUsed;
+    threadMetrics.chunksTransmittedZeroCopy += chunksZeroCopied;
+    threadMetrics.transmittedBytes += messageLen;
+    ++threadMetrics.transmissions;
 
     ibv_send_wr* badTxWorkRequest;
+    
+    CycleCounter<> postSendCtr{&threadMetrics.postSendCycles};
     if (ibv_post_send(qp->qp, &txWorkRequest, &badTxWorkRequest)) {
         DIE("ibv_post_send failed");
     }
@@ -1255,7 +1463,7 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
 
 /**
  * Asychronously transmit the packet described by 'bd' on queue pair 'qp'.
- * This function returns immediately. 
+ * This function returns immediately.
  *
  * \param[in] qp
  *      The QueuePair on which to transmit the packet.
@@ -1264,7 +1472,7 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
  * \param[in] length
  *      The number of bytes used by the packet in the given BufferDescriptor.
  * \param[in] address
- *      UD queue pairs only. The address of the host to send to. 
+ *      UD queue pairs only. The address of the host to send to.
  * \param[in] remoteQKey
  *      UD queue pairs only. The Q_Key of the remote pair to send to.
  * \throw TransportException
@@ -1316,187 +1524,6 @@ postSend(QueuePair* qp, BufferDescriptor *bd, uint32_t length,
     }
 }
 
-// Returns 0 on success or ENOMEM if send queue is full.
-int
-rdma(ibv_wr_opcode opcode,
-     QueuePair* qp, BufferDescriptor *bd, uint32_t bytes,
-     uint64_t remoteVA, uint32_t rkey)
-{
-    assert(bytes <= bd->bytes);
-
-    ibv_sge isge = {
-        reinterpret_cast<uint64_t>(bd->buffer),
-        bytes,
-        bd->mr->lkey
-    };
-    ibv_send_wr txWorkRequest;
-
-    memset(&txWorkRequest, 0, sizeof(txWorkRequest));
-    txWorkRequest.wr_id = reinterpret_cast<uint64_t>(bd);// stash descriptor ptr
-
-    txWorkRequest.next = NULL;
-    txWorkRequest.sg_list = &isge;
-    txWorkRequest.num_sge = 1;
-
-    txWorkRequest.opcode = opcode;
-
-    //txWorkRequest.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
-    txWorkRequest.send_flags = IBV_SEND_SIGNALED;
-    // This will deadlock, since we won't see CQ entries to reap buffers.
-    //txWorkRequest.send_flags = 0;
-
-    txWorkRequest.wr.rdma.remote_addr = remoteVA;
-    txWorkRequest.wr.rdma.rkey = rkey;
-
-
-    ibv_send_wr *bad_txWorkRequest;
-    int r = ibv_post_send(qp->qp, &txWorkRequest, &bad_txWorkRequest);
-
-    // ENOMEM is returned when send queue is full.
-    if (r == ENOMEM)
-        return r;
-
-    if (r) {
-        LOG(ERROR, "ibv_post_send failed errno %d %s", errno, strerror(errno));
-        DIE("ibv_post_send failed for RDMA Read of 0x%lx with rkey 0x%x",
-                remoteVA, rkey);
-    }
-
-    //LOG(ERROR, "Posted RDMA read of %u bytes with bd %lu (capacity %u)",
-    //        bytes, reinterpret_cast<uint64_t>(bd), bd->bytes);
-
-    return 0;
-}
-
-int
-rdmaRead(QueuePair* qp, BufferDescriptor *bd, uint32_t bytes,
-         uint64_t remoteVA, uint32_t rkey)
-{
-    return rdma(IBV_WR_RDMA_READ, qp, bd, bytes, remoteVA, rkey);
-}
-
-int
-rdmaRead2(QueuePair* qp, BufferDescriptor* bd, uint32_t bytesPerVA,
-          uint64_t* remoteVAs, uint32_t remoteVACount, uint32_t rkey)
-{
-    assert(bytesPerVA * remoteVACount <= bd->bytes);
-
-    ibv_send_wr txWorkRequests[remoteVACount];
-    ibv_sge isge[remoteVACount];
-
-    for (uint32_t i = 0 ; i < remoteVACount; ++i) {
-        LOG(INFO, "%d bytesPerVA %u remoteVA %lu %u", i, bytesPerVA, remoteVAs[i], rkey);
-        isge[i] = {
-            reinterpret_cast<uint64_t>(bd->buffer) + (bytesPerVA * i),
-            bytesPerVA,
-            bd->mr->lkey
-        };
-        ibv_send_wr& txWorkRequest = txWorkRequests[i];
-
-        memset(&txWorkRequest, 0, sizeof(txWorkRequest));
-        txWorkRequest.wr_id = reinterpret_cast<uint64_t>(bd);// stash descriptor ptr
-        txWorkRequest.next = i == remoteVACount ? NULL : &txWorkRequests[i + 1];
-        txWorkRequest.sg_list = &isge[i];
-        txWorkRequest.num_sge = 1;
-        txWorkRequest.opcode = IBV_WR_RDMA_READ;
-        txWorkRequest.send_flags = IBV_SEND_SIGNALED;
-
-        txWorkRequest.wr.rdma.remote_addr = remoteVAs[i];
-        txWorkRequest.wr.rdma.rkey = rkey;
-    }
-
-    for (uint32_t i = 0 ; i < remoteVACount; ++i) {
-        ibv_send_wr& wr = txWorkRequests[i];
-        LOG(INFO,
-            "wr[%d]:\n"
-            "wr_id: %lu\n"
-            "next: %p\n"
-            "sg_list: %p\n"
-            "num_sge: %u\n"
-            "opcode: %d\n"
-            "send_flags: %d\n"
-            "remote_addr: %lu\n"
-            "rkey: %u\n",
-            i, wr.wr_id, wr.next, wr.sg_list, wr.num_sge, wr.opcode,
-            wr.send_flags, wr.wr.rdma.remote_addr, wr.wr.rdma.rkey);
-
-    }
-
-    ibv_send_wr *bad_txWorkRequest;
-    int r = ibv_post_send(qp->qp, &txWorkRequests[0], &bad_txWorkRequest);
-
-    // ENOMEM is returned when send queue is full.
-    if (r == ENOMEM)
-        return r;
-
-    if (r) {
-        LOG(ERROR, "ibv_post_send failed errno %d %s", errno, strerror(errno));
-        DIE("ibv_post_send failed for RDMA Read of 0x%lx with rkey 0x%x",
-                remoteVAs[0], rkey);
-    }
-
-    //LOG(ERROR, "Posted RDMA read of %u bytes with bd %lu (capacity %u)",
-    //        bytes, reinterpret_cast<uint64_t>(bd), bd->bytes);
-
-    return 0;
-}
-
-int
-rdmaWrite(QueuePair* qp, Chunk* message, uint32_t chunkCount,
-         uint32_t messageLen, uint64_t remoteVA, uint32_t rkey)
-{
-    if (chunkCount > MAX_TX_SGE_COUNT)
-        DIE("Tried to transmit too many chunks in a single message.");
-
-    ibv_sge isge[chunkCount];
-
-    for (uint32_t i = 0 ; i < chunkCount; ++i) {
-        Chunk& chunk = message[i];
-
-        const uintptr_t addr = reinterpret_cast<const uintptr_t>(chunk.p);
-        bool inBounds = addr >= logMemoryBase &&
-            (addr + chunk.len) <= (logMemoryBase + logMemoryBytes);
-        if (!inBounds)
-            DIE("Tried to transmit a chunk that wasn't in the log.");
-
-        isge[i] = {
-            addr,
-            chunk.len,
-            logMemoryRegion->lkey
-        };
-    }
-    ibv_send_wr txWorkRequest;
-
-    memset(&txWorkRequest, 0, sizeof(txWorkRequest));
-    txWorkRequest.wr_id = 0;
-    txWorkRequest.next = NULL;
-    txWorkRequest.sg_list = isge;
-    txWorkRequest.num_sge = chunkCount;
-    txWorkRequest.opcode = IBV_WR_RDMA_WRITE;
-    txWorkRequest.send_flags = IBV_SEND_SIGNALED;
-
-    txWorkRequest.wr.rdma.remote_addr = remoteVA;
-    txWorkRequest.wr.rdma.rkey = rkey;
-
-    // We can get a substantial latency improvement (nearly 2usec less per RTT)
-    // by inlining data with the WQE for small messages. The Verbs library
-    // automatically takes care of copying from the SGEs to the WQE.
-    //if (messageLen <= MAX_INLINE_DATA)
-        //txWorkRequest.send_flags |= IBV_SEND_INLINE;
-
-    chunksTransmitted += chunkCount;
-    chunksTransmittedZeroCopy += chunkCount;
-
-    ibv_send_wr* badTxWorkRequest;
-    int r = ibv_post_send(qp->qp, &txWorkRequest, &badTxWorkRequest);
-    if (r == ENOMEM)
-        return r;
-
-    if (r)
-        DIE("ibv_post_send failed: %d %s", r, strerror(r));
-
-    return 0;
-}
 
 /**
  * Synchronously transmit the packet described by 'bd' on queue pair 'qp'.
@@ -1510,7 +1537,7 @@ rdmaWrite(QueuePair* qp, Chunk* message, uint32_t chunkCount,
  * \param[in] length
  *      The number of bytes used by the packet in the given BufferDescriptor.
  * \param[in] address
- *      UD queue pairs only. The address of the host to send to. 
+ *      UD queue pairs only. The address of the host to send to.
  * \param[in] remoteQKey
  *      UD queue pairs only. The Q_Key of the remote pair to send to.
  * \throw
@@ -1533,16 +1560,15 @@ postSendAndWait(QueuePair* qp, BufferDescriptor *bd,
 
 bool
 clientTryExchangeQueuePairs(struct sockaddr_in *sin,
-    QueuePairTuple *outgoingQpt, QueuePairTuple *incomingQpt)
+                            QueuePairTuple *outgoingQpt, QueuePairTuple *incomingQpt)
 {
     bool haveSent = false;
     uint64_t startTime = rdtsc();
-
     while (1) {
         if (!haveSent) {
             ssize_t len = sendto(clientSetupSocket, outgoingQpt,
-                sizeof(*outgoingQpt), 0, reinterpret_cast<sockaddr *>(sin),
-                sizeof(*sin));
+                                 sizeof(*outgoingQpt), 0, reinterpret_cast<sockaddr *>(sin),
+                                 sizeof(*sin));
             if (len == -1) {
                 if (errno != EINTR && errno != EAGAIN) {
                     DIE("sendto returned error %d: %s",
@@ -1550,7 +1576,7 @@ clientTryExchangeQueuePairs(struct sockaddr_in *sin,
                 }
             } else if (len != sizeof(*outgoingQpt)) {
                 DIE("sendto returned bad length (%Zd) while "
-                    "sending to ip: [%s] port: [%d]", len,
+                            "sending to ip: [%s] port: [%d]", len,
                     inet_ntoa(sin->sin_addr), NTOHS(sin->sin_port));
             } else {
                 haveSent = true;
@@ -1560,8 +1586,9 @@ clientTryExchangeQueuePairs(struct sockaddr_in *sin,
         struct sockaddr_in recvSin;
         socklen_t sinlen = sizeof(recvSin);
         ssize_t len = recvfrom(clientSetupSocket, incomingQpt,
-            sizeof(*incomingQpt), 0,
-            reinterpret_cast<sockaddr *>(&recvSin), &sinlen);
+                               sizeof(*incomingQpt), 0,
+                               reinterpret_cast<sockaddr *>(&recvSin), &sinlen);
+
         if (len == -1) {
             if (errno != EINTR && errno != EAGAIN) {
                 DIE("recvfrom returned error %d: %s",
@@ -1569,14 +1596,13 @@ clientTryExchangeQueuePairs(struct sockaddr_in *sin,
             }
         } else if (len != sizeof(*incomingQpt)) {
             DIE("recvfrom returned bad length (%Zd) while "
-                "receiving from ip: [%s] port: [%d]", len,
+                        "receiving from ip: [%s] port: [%d]", len,
                 inet_ntoa(recvSin.sin_addr), NTOHS(recvSin.sin_port));
         } else {
             if (outgoingQpt->getNonce() == incomingQpt->getNonce())
                 return true;
-
-            LOG(WARNING, "bad nonce from %s (expected 0x%016lx, "
-                "got 0x%016lx, port %d); ignoring",
+            LOG(INFO, "bad nonce from %s (expected 0x%016lx, "
+                    "got 0x%016lx, port %d); ignoring",
                 inet_ntoa(sin->sin_addr), outgoingQpt->getNonce(),
                 incomingQpt->getNonce(), clientPort);
         }
@@ -1587,38 +1613,35 @@ clientTryExchangeQueuePairs(struct sockaddr_in *sin,
 }
 
 QueuePair*
-clientTrySetupQueuePair(const char* hostName, uint16_t port)
+clientTrySetupQueuePair(const char* server, uint16_t port)
 {
-    IpAddress address{hostName, port};
-    sockaddr_in* sin = reinterpret_cast<sockaddr_in*>(&address.address);
+    IpAddress address{server, static_cast<uint16_t>(port)};
+    sockaddr_in *sin = reinterpret_cast<sockaddr_in *>(&address.address);
 
     // Create a new QueuePair and send its parameters to the server so it
     // can create its qp and reply with its parameters.
-    QueuePair *qp = new QueuePair(IBV_QPT_RC,
-                                  clientSrq,
-                                  commonTxCq, clientRxCq,
-                                  MAX_TX_QUEUE_DEPTH,
-                                  MAX_SHARED_RX_QUEUE_DEPTH);
+    std::unique_ptr<QueuePair> qp{new QueuePair(IBV_QPT_RC,
+                                                clientSrq,
+                                                commonTxCq, clientRxCq,
+                                                MAX_TX_QUEUE_DEPTH,
+                                                MAX_SHARED_RX_QUEUE_DEPTH)};
+    qp->setPeerName(server);
+
+    uint32_t i;
     uint64_t nonce = rand();
     LOG(DEBUG, "starting to connect to %s via local port %d, nonce 0x%lx",
-            inet_ntoa(sin->sin_addr), clientPort, nonce);
+        inet_ntoa(sin->sin_addr), clientPort, nonce);
 
-    for (uint32_t i = 0; i < QP_EXCHANGE_MAX_TIMEOUTS; i++) {
+    for (i = 0; i < QP_EXCHANGE_MAX_TIMEOUTS; i++) {
         QueuePairTuple outgoingQpt(uintptr_t(logMemoryRegion->addr),
                                    logMemoryRegion->rkey,
                                    uint16_t(lid),
                                    qp->getLocalQpNumber(),
                                    qp->getInitialPsn(), nonce);
         QueuePairTuple incomingQpt;
-        bool gotResponse;
 
-        try {
-            gotResponse = clientTryExchangeQueuePairs(sin, &outgoingQpt,
-                                                      &incomingQpt);
-        } catch (...) {
-            delete qp;
-            throw;
-        }
+        bool gotResponse = clientTryExchangeQueuePairs(sin, &outgoingQpt,
+                                                       &incomingQpt);
 
         if (!gotResponse) {
             // To avoid log clutter, only print a log message for the
@@ -1626,28 +1649,34 @@ clientTrySetupQueuePair(const char* hostName, uint16_t port)
             if (i == 0) {
                 LOG(WARNING, "timed out waiting for response; retrying");
             }
+            if (i > 1000) {
+                DIE("Couldn't establish queue pair with %s:%u", server, port);
+            }
             continue;
         }
         LOG(DEBUG, "connected to %s via local port %d",
-                inet_ntoa(sin->sin_addr), clientPort);
+            inet_ntoa(sin->sin_addr), clientPort);
 
         // plumb up our queue pair with the server's parameters.
         qp->plumb(&incomingQpt);
         LOG(DEBUG, "New queue pair nonce 0x%lx, remote log VA 0x%lx, "
                 "remote log rkey 0x%x",
-                incomingQpt.getNonce(), incomingQpt.getLogVA(),
-                incomingQpt.getRkey());
+            incomingQpt.getNonce(), incomingQpt.getLogVA(),
+            incomingQpt.getRkey());
         remoteLogVA = incomingQpt.getLogVA();
         remoteLogRkey = incomingQpt.getRkey();
-        return qp;
+        break;
     }
 
-    LOG(WARNING, "failed to exchange with server within allotted "
-        "(sent request %u times, local port %d)",
-        QP_EXCHANGE_MAX_TIMEOUTS,
-        clientPort);
-    delete qp;
-    DIE("failed to connect to host");
+    if (i == QP_EXCHANGE_MAX_TIMEOUTS) {
+        LOG(WARNING, "failed to exchange with server within allotted "
+                "(sent request %u times, local port %d)",
+            QP_EXCHANGE_MAX_TIMEOUTS,
+            clientPort);
+        DIE("failed to connect to host");
+    }
+
+    return qp.release();
 }
 
 struct Header
@@ -1763,226 +1792,247 @@ void registerMemory(void* base, size_t bytes)
     LOG(NOTICE, "Registered %Zd bytes at %p", bytes, base);
 }
 
-QueuePair* clientQP = nullptr;
-
-enum Mode { MODE_SEND, MODE_WRITE, MODE_READ, MODE_ALL };
-
-static const int messages = 10 * 1000 * 1000;
-static const size_t logSize = 4lu * 1024 * 1024 * 1024;
-
-Mode mode = MODE_ALL;
-bool isServer = false;
-bool useHugePages = false;
-size_t chunkSize = 100;
-size_t nChunks = 32;
-
-uint64_t benchSend()
+void pinTo(size_t i)
 {
-    Chunk chunks[nChunks];
-    uint32_t start = 0;
-    for (size_t i = 0; i < nChunks; ++i) {
-        start = generateRandom();
-        start = start % (logSize - chunkSize);
-        chunks[i].p = (void*)(logMemoryBase + start);
-        chunks[i].len = chunkSize;
-    }
-
-    CycleCounter<> counter{};
-
-    for (int i = 0; i < messages ; ++i) {
-        sendZeroCopy(chunks, nChunks, nChunks * chunkSize, clientQP);
-        if ((i % 100000) == 0) {
-            LOG(ERROR, "Chunks tx zero-copy: %u / %u",
-                    chunksTransmittedZeroCopy, chunksTransmitted);
-        }
-    }
-
-    return counter.stop();
+   cpu_set_t cpuset;
+   CPU_ZERO(&cpuset);
+   CPU_SET(i, &cpuset);
+   int r = pthread_setaffinity_np(pthread_self(),
+                                  sizeof(cpu_set_t), &cpuset);
+   assert(r == 0);
 }
 
-uint64_t benchRDMAWrite()
-{
-    Chunk chunks[nChunks];
-    uint32_t start = 0;
-    for (size_t i = 0; i < nChunks; ++i) {
-        start = generateRandom();
-        start = start % (logSize - chunkSize);
-        chunks[i].p = (void*)(logMemoryBase + start);
-        chunks[i].len = chunkSize;
+/**
+ * Runs a benchmark. Makes life easier by spawning threads and hoooking them
+ * up to thread-specific stats and state, synchronizing them on start/stop,
+ * etc.
+ */
+class Benchmark {
+  public:
+
+    class ThreadState {
+      public:
+        ThreadState(QueuePair* qp)
+          : qp{qp}
+          , chunks{}
+        {}
+
+        std::unique_ptr<QueuePair> qp;
+        std::vector<Chunk> chunks;
+    };
+
+    Benchmark(const std::vector<std::string>& servers,
+              size_t nChunks,
+              size_t chunkSize,
+              size_t nDeltas,
+              size_t deltaSize,
+              bool doZeroCopy,
+              double seconds,
+              double warmupSeconds)
+      : servers{servers}
+      , nChunks{nChunks}
+      , chunkSize{chunkSize}
+      , nDeltas{nDeltas}
+      , deltaSize{deltaSize}
+      , doZeroCopy{doZeroCopy}
+      , seconds{seconds}
+      , warmupSeconds{warmupSeconds}
+      , threads{}
+      , threadStates{}
+      , nReady{}
+      , go{}
+    {
     }
 
-    CycleCounter<> counter{};
+    /// Start threads and run the benchmark.
+    void start() {
+        LOG(INFO, "Clients establishing qpairs");
+        for (size_t i = 0; i < servers.size(); ++i) {
+            threadStates.emplace_back(clientTrySetupQueuePair(servers.at(i).c_str(),
+                                                              PORT));
+            threads.emplace_back(std::thread{&Benchmark::entry,
+                                 this, i, &threadStates.back()});
 
-    for (int i = 0; i < messages ; ++i) {
-        while (rdmaWrite(clientQP, chunks, nChunks, nChunks * chunkSize,
-                            remoteLogVA + start, remoteLogRkey) == ENOMEM)
-        {
+        }
+        LOG(INFO, "All Clients established qpairs");
+
+        while (nReady != servers.size())
+            std::this_thread::yield();
+
+        go = true;
+
+        for (auto& thread : threads)
+            thread.join();
+
+        while (freeTxBuffers.size() < MAX_TX_QUEUE_DEPTH)
             reapTxBuffers();
-        }
-        if ((i % 100000) == 0) {
-            LOG(ERROR, "Chunks tx zero-copy: %u / %u",
-                    chunksTransmittedZeroCopy, chunksTransmitted);
-        }
     }
 
-    return counter.stop();
-}
+    void entry(size_t threadNum, ThreadState* threadState) {
+        LOG(DEBUG, "Running benchmark with %lu clients %lu chunksPerMessage "
+                "%lu chunkSize %lu deltas %lu deltaSize",
+                servers.size(), nChunks, chunkSize,
+                nDeltas, deltaSize);
 
-uint64_t benchRDMARead()
-{
-    CycleCounter<> counter{};
+        pinTo(threadNum);
 
-    for (int i = 0; i < messages; ++i) {
-        BufferDescriptor* bd = getTransmitBuffer();
+        threadState->chunks.resize(nDeltas + nChunks);
+        uint32_t start = 0;
 
-        //uint64_t start = 0;
+        for (size_t i = 0; i < nDeltas; ++i) {
+            start = generateRandom();
+            start = start % (logSize - deltaSize);
+            threadState->chunks[i].p = (void*)(logMemoryBase + start);
+            threadState->chunks[i].len = deltaSize;
+        }
 
-        uint64_t remoteVAs[32];
-        for (int i = 0; i < 32; ++i) {
-            uint64_t start = generateRandom();
+        for (size_t i = 0; i < nChunks; ++i) {
+            start = generateRandom();
             start = start % (logSize - chunkSize);
-            remoteVAs[i] = remoteLogVA + start;
+            threadState->chunks[i].p = (void*)(logMemoryBase + start);
+            threadState->chunks[i].len = chunkSize;
         }
 
-        while (rdmaRead2(clientQP, bd, chunkSize,
-                        &remoteVAs[0], 32, remoteLogRkey) == ENOMEM)
-        //while (rdmaRead(clientQP, bd, chunkSize,
-        //                remoteLogVA + start, remoteLogRkey) == ENOMEM)
+        nReady++;
+        while (!go);
+
+        // warmup
+        run(threadState, warmupSeconds);
+
+        threadMetrics.reset();
+
+        uint64_t cycles = 0;
         {
+            CycleCounter<> counter{&cycles};
+            run(threadState, seconds);
         }
-        if ((i % 100000) == 0) {
-            LOG(ERROR, "Chunks rx zero-copy RDMA read: %u (%lu errors)", i + 1, txFailures);
-        }
-    }
 
-    return counter.stop();
-}
+        threadMetrics.dump(!doZeroCopy, threadState->qp->getPeerName(),
+                           cycles, nChunks, chunkSize, nDeltas, deltaSize,
+                           seconds, warmupSeconds);
 
-void dumpStats(Mode mode, uint64_t cycles, int chunksPerMessage, uint32_t sgLen)
-{
-    double seconds = Cycles::toSeconds(cycles);
-    double mbs =
-      (double(messages * chunksPerMessage * chunkSize) / (1u << 20)) / seconds;
-    double usPerMessage = seconds / messages * 1e6;
-    printf("> %d %u %0.2f %0.3f\n", mode, sgLen, mbs, usPerMessage);
-}
+        LOG(ERROR, "Chunks tx zero-copy[%s]: %lu / %lu",
+            threadState->qp->getPeerName(),
+            threadMetrics.chunksTransmittedZeroCopy,
+            threadMetrics.chunksTransmitted);
 
-void measure() {
-    /* Some junk to do synchronous sends, non-zero-copy
-     * Probably need cleanup.
-     *
-    for (int i = 0; i < messages ; ++i) {
-        BufferDescriptor* bd = getTransmitBuffer();
-        assert(bd->buffer);
-        assert(bd->bytes);
-        assert(bd->mr);
-
-        Header* header = reinterpret_cast<Header*>(bd->buffer);
-        header->len = 6;
-
-        bd->messageBytes = sizeof(*header) + 6;
-        memcpy(bd->buffer + sizeof(*header), "hello", 6);
-
-        LOG(INFO, "Client posting message");
-
-        postSendAndWait(qp, bd, bd->messageBytes);
-    }
-    */
-
-    printf("> mode sgLen mbs usPerMessage\n");
-
-    uint64_t cycles = 0;
-    if (mode == MODE_SEND || mode == MODE_ALL) {
-        for (uint32_t sgLen = 1; sgLen <= 32; ++sgLen) {
-            MAX_TX_SGE_COUNT = sgLen;
-            LOG(INFO, "Running sends with sgLen %d", sgLen);
-            cycles = benchSend();
-            dumpStats(MODE_SEND, cycles, nChunks, sgLen);
+        if (doZeroCopy &&
+            threadMetrics.chunksTransmittedZeroCopy !=
+                threadMetrics.chunksTransmitted)
+        {
+            DIE("Not all chunks were zero copied in zero copy mode");
         }
     }
 
-    sleep(5);
-    reapTxBuffers();
-
-    if (mode == MODE_WRITE || mode == MODE_ALL) {
-        uint32_t sgLen = MAX_TX_SGE_COUNT = nChunks;
-        LOG(INFO, "Running writes with sgLen %d", sgLen);
-        cycles = benchRDMAWrite();
-        dumpStats(MODE_WRITE, cycles, nChunks, sgLen);
+    void run(ThreadState* threadState, double seconds) {
+        const uint64_t cyclesToRun = Cycles::fromSeconds(seconds);
+        const uint64_t start = Cycles::rdtsc();
+        while (true) {
+            //sendZeroCopy(&threadState->chunks[0], nChunks, nChunks * chunkSize,
+            //             threadState->qp.get(), doZeroCopy);
+            if (doZeroCopy) {
+                sendStrictZeroCopy(&threadState->chunks[0],
+                                   nDeltas + nChunks,
+                                   nDeltas * deltaSize + nChunks * chunkSize,
+                                   threadState->qp.get());
+            } else {
+                sendStrictCopy(&threadState->chunks[0],
+                               nDeltas + nChunks,
+                               nDeltas * deltaSize + nChunks * chunkSize,
+                               threadState->qp.get());
+            }
+            if (Cycles::rdtsc() - start > cyclesToRun)
+                break;
+        }
     }
 
-    sleep(5);
-    reapTxBuffers();
+  private:
+    const std::vector<std::string> servers;
 
-    if (mode == MODE_READ || mode == MODE_ALL) {
-        uint32_t sgLen = MAX_TX_SGE_COUNT = 1;
-        LOG(INFO, "Running reads with sgLen %d", sgLen);
-        // RDMA Read can only fetch 1 item per op.
-        // Doesn't matter for RDMA logic below, but final stat dump multiplies
-        // by nChunks, so this needs to be right to get correct stats out.
-        cycles = benchRDMARead();
-        dumpStats(MODE_READ, cycles, 1, 1);
-    }
-}
+    const size_t nChunks;
+    const size_t chunkSize;
+
+    const size_t nDeltas;
+    const size_t deltaSize;
+
+    const bool doZeroCopy;
+
+    const double seconds;
+    const double warmupSeconds;
+
+    std::deque<std::thread> threads;
+    std::deque<ThreadState> threadStates;
+
+    std::atomic<uint64_t> nReady;
+    std::atomic<bool> go;
+};
 
 static const char USAGE[] =
 R"(ibv-bench.
 
     Usage:
       ibv-bench server <hostname> [--hugePages]
-      ibv-bench client <hostname> [--hugePages] [--chunkSize=SIZE] [--chunksPerMessage=CHUNKS] [--sgLength=SGLEN] [--mode=MODE]
+      ibv-bench client <hostname>... [--hugePages] [--minChunkSize=SIZE] [--maxChunkSize=SIZE] [--minChunksPerMessage=CHUNKS] [--maxChunksPerMessage=CHUNKS] [--seconds=SECONDS] [--warmup=SECONDS]
       ibv-bench (-h | --help)
 
     Options:
-      -h --help                  Show this screen
-      --hugePages                Use huge pages
-      --chunkSize=SIZE           Size of individual objects [default: 100]
-      --chunksPerMessage=CHUNKS  Number of objects to send per send/write, ignored for read [default: 32]
-      --sgLength=SGLEN           Max S/G list length [default: 32]
-      --mode=MODE                send, read, write, or all [default: all]
+      -h --help                     Show this screen
+      --hugePages                   Use huge pages
+      --minChunkSize=SIZE           Smallest size of individual objects [default: 1]
+      --maxChunkSize=SIZE           Smallest size of individual objects [default: 1024]
+      --minChunksPerMessage=CHUNKS  Min Number of objects to send per send [default: 1]
+      --maxChunksPerMessage=CHUNKS  Max number of objects to send per send [default: 32]
+      --seconds=SECONDS             Number of seconds to run per chunk count/size pair [default: 10]
+      --warmup=SECONDS              Number of seconds to run per chunk count/size pair before starting measurment [default: 5]
 )";
 
 int main(int argc, const char** argv)
 {
+    Cycles::init();
+
     std::map<std::string, docopt::value> args
         = docopt::docopt(USAGE,
                          { argv + 1, argv + argc },
                          true,               // show help if requested
-                         "ibv-bench 0.1");  // version string
+                         "ibv-bench 0.2");  // version string
 
     // Dump command line args for debugging.
-    for (auto const& arg : args) {
+    for (auto const& arg : args)
         std::cerr << arg.first <<  " " << arg.second << std::endl;
-    }
 
-    isServer = bool(args["server"]) && args["server"].asBool();
-    useHugePages = bool(args["--hugePages"]) && args["--hugePages"].asBool();
-    chunkSize = args["--chunkSize"].asLong();
-    nChunks = args["--chunksPerMessage"].asLong();
+    const bool isServer = bool(args["server"]) && args["server"].asBool();
+    const bool useHugePages = bool(args["--hugePages"]) &&
+                              args["--hugePages"].asBool();
+    const size_t minChunkSize = args["--minChunkSize"].asLong();
+    const size_t maxChunkSize = args["--maxChunkSize"].asLong();
+    const size_t minChunksPerMessage = args["--minChunksPerMessage"].asLong();
+    const size_t maxChunksPerMessage = args["--maxChunksPerMessage"].asLong();
 
-    const char* hostName = args["<hostname>"].asString().c_str();
+    const double seconds = double(args["--seconds"].asLong());
+    const double warmupSeconds = double(args["--warmup"].asLong());
 
-    mode = MODE_ALL;
-    if (args["--mode"].asString() == "send") {
-        mode = MODE_SEND;
-    } else if (args["--mode"].asString() == "write") {
-        mode = MODE_WRITE;
-    } else if (args["--mode"].asString() == "read") {
-        mode = MODE_READ;
-    }
+    assert(minChunkSize > 0);
+    assert(maxChunkSize <= 1024);
+    assert(minChunksPerMessage >= 0);
+    assert(maxChunksPerMessage <= 1024);
+    assert(seconds > 0.);
+    assert(warmupSeconds >= 0.);
 
-    LOG(INFO, "Running as %s with %s",
-            isServer ? "server" : "client", hostName);
+    std::vector<std::string> hostNames = args["<hostname>"].asStringList();
 
-    setup(isServer, hostName);
+    LOG(INFO, "Running as %s", isServer ? "server" : "client");
+    for (const auto& hostName : hostNames)
+        LOG(INFO, " > %s", hostName.c_str());
+    LOG(INFO, "Number of client server connections: %lu", hostNames.size());
 
+    setup(isServer ? hostNames.at(0).c_str() : nullptr);
     // Allocate a GB and register it with the HCA.
     LOG(INFO, "Registering log memory");
     void* base = nullptr;
 
     Tub<LargeBlockOfMemory<>> largeBlockOfMemory{};
     if (useHugePages) {
-        largeBlockOfMemory.construct(logSize);
+        largeBlockOfMemory.construct("/dev/hugetlbfs/ibv-bench-log", logSize);
         base = largeBlockOfMemory->get();
     } else {
         base = xmemalign(4096, logSize);
@@ -1998,13 +2048,62 @@ int main(int argc, const char** argv)
             poll();
         }
     } else {
-        LOG(INFO, "Client running stuff");
+        LOG(INFO, "Running client benchmarks");
 
-        clientQP = clientTrySetupQueuePair(hostName, PORT);
+        ThreadMetrics::dumpHeader();
 
-        LOG(INFO, "Client established qp");
+        //for (size_t chunkSize = minChunkSize;
+        //     chunkSize <= maxChunkSize;
+        //     chunkSize *= 2)
+        const std::vector<size_t> sizes{128, 1024};
+        for (size_t chunkSize : sizes)
+        {
+            for (size_t nChunks = minChunksPerMessage;
+                 nChunks <= maxChunksPerMessage && nChunks <= 32;
+                 ++nChunks)
+            {
+                {
+                    LOG(INFO, "Running Zero Copy on #chunks: %lu size: %lu",
+                            nChunks, chunkSize);
+                    Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
+                                    true /* 0-copy */, seconds, warmupSeconds};
+                    bench.start();
+                }
+                {
+                    LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
+                            nChunks, chunkSize);
+                    Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
+                                    false /* no 0-copy */, seconds, warmupSeconds};
+                    bench.start();
+                }
+            }
+            // Power of 2 number of chunks
+            for (size_t nChunks = 64; nChunks <= maxChunksPerMessage; nChunks *=2) {
+                LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
+                        nChunks, chunkSize);
+                Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
+                                false /* doZeroCopy */, seconds, warmupSeconds};
+                bench.start();
+            }
+        }
 
-        measure();
+        // Delta record tests. For these we use the command line args for
+        // number of chunks for the deltas instead, and we just included a 16
+        // KB base page in each trasmission no matter what.  It's all zero-copy
+        // too.
+        for (size_t deltaSize : sizes)
+        {
+            for (size_t nDeltas = 0; nDeltas <= 31; ++nDeltas)
+            {
+                {
+                    LOG(INFO, "Running Deltas on #deltas: %lu size: %lu",
+                            nDeltas, deltaSize);
+                    Benchmark bench{hostNames, 1, 16384, nDeltas, deltaSize,
+                                    true /* 0-copy */, seconds, warmupSeconds};
+                    bench.start();
+                }
+            }
+        }
     }
 
     return 0;
