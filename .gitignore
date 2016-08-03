@@ -4,3 +4,4 @@ browse.*
 *.o
 ibv-bench
 *.pyc
+logs/
