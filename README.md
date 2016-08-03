@@ -1,13 +1,26 @@
 # ibv-bench
 
-Microbenchmarks for evaluating infiniband verbs performance on [Apt](http://docs.aptlab.net/).
+Microbenchmarks for evaluating infiniband verbs performance on the  [Apt](http://docs.aptlab.net/) cluster.
 
 ## Guidelines for running the benchmarks
-* You'll need an account to use testbeds such as Cloudlab, Apt and Emulab. Follow this [link](http://docs.cloudlab.us/getting-started.html) for detailed instructions.
-* The benchmarks need to be run on Apt site. Find the hardware specifications [here](http://docs.aptlab.net/hardware.html).
-* You can either use the [infiniband_dev](https://www.cloudlab.us/p/utahstud/infiniband_dev) profile or create your own. If you are using infiniband_dev, you'll find details on how the hardware is configured in the instructions before initialisation.
-* Use [emulab.py](scripts/emulab.py) for straight forward execution and collection of results.
-* For instance, if you initialised infiniband_dev profile with 4 nodes. When you run the following, the benchmark is run on a 3 client setup.
+
+* Since these experiments require a particular hardware and software setup to
+  run, the recommended way of running them (and the way described in this
+  README) is to use the CloudLab testbed, which will give you access to the
+  [apt cluster](http://docs.aptlab.net/hardware.html).
+* You'll need an account to use the testbed. If you already have an annount on
+  cloudlab.us or emulab.net, you can simply use that account. If you don't ahve
+  one, follow this [link](http://docs.cloudlab.us/getting-started.html) for
+  detailed instructions. Accounts are open (and free) to all academic
+  researchers.
+* You will use a "profile", which is a pre-configured hardware description and
+  set of disk images. We recommend using the
+  [infiniband_dev](https://www.cloudlab.us/p/utahstud/infiniband_dev) profile
+  that we have built.
+* Use [emulab.py](scripts/emulab.py) for straight forward execution and
+  collection of results.
+* For instance, if you initialised infiniband_dev profile with 4 nodes. When
+  you run the following, the benchmark is run on a 3 client setup.
 ```
 python scripts/emulab.py nameofnode-0.apt.emulab.net
 ```
@@ -23,3 +36,7 @@ python scripts/emulab.py nameofnode-0.apt.emulab.net
     Note: client and server processes are reversed from the conventional sense because the client process is the one actually doing most of the work.
     ``` 
     * Collects the log files from the run and rsyncs them back to the directory
+
+## Steps for running the benchmarks
+
+
