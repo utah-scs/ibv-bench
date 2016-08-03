@@ -189,6 +189,9 @@ def main():
 
     server = sys.argv[1]
 
+    subprocess.check_call('git submodule init', shell=True, stdout=sys.stdout)
+    subprocess.check_call('git submodule update', shell=True, stdout=sys.stdout)
+
     extra_args = ''
     num_clients = None
     for arg in sys.argv[2:]:
