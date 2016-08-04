@@ -5,7 +5,7 @@ if [[ "$r" == "0" ]]; then
     exit 0
 fi
 
-umount /dev/hugetlbfs > /dev/null
+umount /dev/hugetlbfs > /dev/null 2>&1
 mkdir -p /dev/hugetlbfs
 chmod 777 /dev/hugetlbfs
 mount -t hugetlbfs none /dev/hugetlbfs -o pagesize=1G,size=4G
