@@ -6,6 +6,12 @@ import sys
 import subprocess
 import time
 import datetime
+import logging
+import argparse
+import pprint
+
+logger=logging.getLogger("BenchmarkRunner")
+
 
 def ssh(server, cmd, checked=True):
     if checked:
@@ -31,6 +37,9 @@ class BenchmarkRunner(object):
     def __enter__(self):
         self.populate_hosts()
         if self.num_clients is not None:
+            if self.num_clients >= len(self.node_names):
+                logger.error("Not enough machines, use less number of clients")
+                sys.exit(1)
             self.node_names = self.node_names[:self.num_clients + 1]
             self.host_names = self.host_names[:self.num_clients + 1]
         self.start_time = datetime.datetime.now()
@@ -42,7 +51,7 @@ class BenchmarkRunner(object):
     def populate_hosts(self):
         out = subprocess.check_output("ssh %s /usr/bin/geni-get manifest" % self.server,
                                       shell=True)
-
+        logger.debug("Manifest output %s", pprint.pformat(out))
         root = ET.fromstring(out)
         for child in root.getchildren():
           if child.tag.endswith('node'):
@@ -97,11 +106,13 @@ class BenchmarkRunner(object):
         return ['%s.apt.emulab.net' % h for h in hosts]
 
     def send_code(self, server):
+        logger.info("Sending code to %s", server)
         subprocess.check_call("rsync -ave ssh --exclude 'logs/*' " +
                               "./ %s:~/ibv-bench/" % server,
                               shell=True, stdout=sys.stdout)
 
     def compile_code(self, server):
+        logger.info("Compiling code to %s", server)
         ssh(server, '(cd ibv-bench; (make clean; make -j 8) &> ~/ibv-bench/build.log)')
 
     def start_servers(self):
@@ -109,18 +120,23 @@ class BenchmarkRunner(object):
         for host, node in zip(self.host_names[1:], self.node_names[1:]):
             cmd = ('(cd ibv-bench; ./ibv-bench server %s %s > server_%s.log 2>&1)' %
                         (node, self.extra_server_args, node))
+            logger.debug("Starting server with cmd:%s", cmd)
             procs.append(subprocess.Popen(['ssh', host, cmd]))
         return procs
 
     def killall(self):
         for host in self.host_names:
+            logger.debug("Killing processes on %s",host)
             ssh(host, 'pkill -9 ibv-bench', checked=False)
 
     def update_limits(self, server):
+        logger.debug("Updating pinning limits")
         ssh(server, 'sudo ~/ibv-bench/scripts/disable-pin-limits')
 
     def check_huge_pages(self, server):
         r = ssh(server, '~/ibv-bench/scripts/check-hugepages', checked=False)
+        if r:
+            logger.error("Checking hugepages failed on %s", server)
         return r == 0
 
     def enable_huge_pages(self, server):
@@ -128,24 +144,23 @@ class BenchmarkRunner(object):
         reboots the machine, so this script needs to be restarted if
         this is used.
         """
+        logger.info("Enabling hugepages on %s, Machine will reboot", server)
         ssh(server, 'sudo ~/ibv-bench/scripts/enable-hugepages')
         ssh(server, 'sudo reboot')
 
     def mount_huge_pages(self, server):
+        logger.debug("Mounting hugetlbfs on %s", server)
         ssh(server, 'sudo ~/ibv-bench/scripts/mount-hugepages')
 
     def run(self):
         try:
             for host in self.host_names:
-                print 'Sending code to %s' % host
                 self.send_code(host)
 
             some_rebooting = False
             for host in self.host_names:
-                print 'Checking that hugepages are enabled on %s' % host
                 r = self.check_huge_pages(host)
                 if not r:
-                    print 'Enabling hugepages on %s' % host
                     self.enable_huge_pages(host)
                     some_rebooting = True
             if some_rebooting:
@@ -154,19 +169,17 @@ class BenchmarkRunner(object):
                     "restart this script when all machines are back online")
 
             for host in self.host_names:
-                print 'Fixing pinning limits and mounting hugetlbfs %s' % host
                 self.update_limits(host)
                 self.mount_huge_pages(host)
 
             for host in self.host_names:
-                print 'Compiling code on %s' % host
                 self.compile_code(host)
 
             procs = self.start_servers()
 
             time.sleep(5)
 
-            print 'Starting the client'
+            logger.info("Starting client processes ...\n Benchmarks will take a few hours.")
             ssh(self.host_names[0],
                 '(cd ibv-bench; ' +
                 './ibv-bench client %s %s > %s-out.log 2> %s-err.log)'
@@ -176,36 +189,37 @@ class BenchmarkRunner(object):
                        self.get_name()))
         finally:
             self.end_time = datetime.datetime.now()
-            print 'Collecting results'
+            logger.info("Collecting results ...")
             self.collect_results()
-            print 'Results collected'
+            logger.info("Results collected")
 
 def main():
     if not os.path.exists(os.path.join('scripts', 'emulab.py')):
         raise Exception('Run this directly from top-level of the project.')
-
-    if len(sys.argv) < 2:
-        raise Exception('Need Emulab server address.')
-
-    server = sys.argv[1]
+    parser = argparse.ArgumentParser(description="\n Runner script to run the benchmark on Apt testbed")
+    requiredNamed = parser.add_argument_group('Required argument(s)')
+    requiredNamed.add_argument("hostname", nargs=1, help=" hostname of node-0 in the format apt**.apt.emulab.net")
+    Optionals = parser.add_argument_group('Optional arguments')
+    Optionals.add_argument("--clients", type=int, default=None, help="Number of clients. Should be <= n-1 for an experiment with n nodes.")
+    Optionals.add_argument("--log-level", default="INFO", help="python logging level")
+    Optionals.add_argument("--cmd", default="run", help="Method to execute. Defaults to run")
+    Optionals.add_argument("--user", default=None, help="Cloudlab username if different from the current user")
+    args, unknowns = parser.parse_known_args()
 
     subprocess.check_call('git submodule init', shell=True, stdout=sys.stdout)
     subprocess.check_call('git submodule update', shell=True, stdout=sys.stdout)
-
-    extra_args = ''
-    num_clients = None
-    for arg in sys.argv[2:]:
-        if arg.startswith('--clients='):
-            num_clients = int(arg.split('=')[1])
-        else:
-            extra_args +=  '%s ' % arg
-
+    if not args.user:
+        server = args.hostname[0]
+    else:
+        server = args.user+"@"+args.hostname[0]
+    num_clients = args.clients
+    extra_args = " ".join(unknowns)
+    loglevel=getattr(logging, args.log_level.upper(), "INFO")
+    logging.basicConfig(level=loglevel)
+    
     with BenchmarkRunner(server, extra_args, num_clients=num_clients) as br:
-        print 'Found hosts %s' % ' '.join(br.host_names)
-        cmd = 'run'
-        if len(sys.argv) == 3:
-            cmd = sys.argv[2]
-
+        logger.info('Found hosts %s' % ' '.join(br.host_names))
+        cmd = args.cmd
         if cmd == 'run':
             br.run()
 
