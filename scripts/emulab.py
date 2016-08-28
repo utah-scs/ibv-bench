@@ -23,7 +23,8 @@ def ssh(server, cmd, checked=True):
 
 class BenchmarkRunner(object):
 
-    def __init__(self, server, extra_args, num_clients=None):
+    def __init__(self, server, extra_args, num_clients=None, user=None):
+        self.user = user
         self.num_clients = num_clients
         self.extra_server_args = '--hugePages'
         self.extra_client_args = extra_args + ' --hugePages'
@@ -57,7 +58,10 @@ class BenchmarkRunner(object):
           if child.tag.endswith('node'):
             for host in child.getchildren():
               if host.tag.endswith('host'):
-                self.host_names.append(host.get('name'))
+                if self.user:
+                    self.host_names.append(self.user + '@' + host.get('name'))
+                else:
+                    self.host_names.append(host.get('name'))
                 self.node_names.append('node-%d' % len(self.node_names))
               if self.node_type is None and host.tag.endswith('hardware_type'):
                 self.node_type = host.get('name')
@@ -228,7 +232,7 @@ def main():
     loglevel=getattr(logging, args.log_level.upper(), "INFO")
     logging.basicConfig(level=loglevel)
     
-    with BenchmarkRunner(server, extra_args, num_clients=num_clients) as br:
+    with BenchmarkRunner(server, extra_args, num_clients=num_clients, user=args.user) as br:
         logger.info('Found hosts %s' % ' '.join(br.host_names))
         cmd = args.cmd
         if cmd == 'run':

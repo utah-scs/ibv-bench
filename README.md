@@ -15,7 +15,7 @@ Microbenchmarks for evaluating infiniband verbs performance on the  [Apt](http:/
   researchers.
 * You will use a "profile", which is a pre-configured hardware description and
   set of disk images. We recommend using the
-  [infiniband_dev](https://www.cloudlab.us/p/utahstud/infiniband_dev) profile
+  [infiniband_dev](https://www.cloudlab.us/p/RAMCloud/infiniband_dev) profile
   that we have built.
 * Use [emulab.py](scripts/emulab.py) for straight forward execution and
   collection of results.
@@ -41,7 +41,7 @@ python scripts/emulab.py nameofnode-0.apt.emulab.net
 
 1. Clone this repository somewhere on your local machine.
 2. Create a new "experiment" on CloudLab's Apt cluster by following this link:
-  https://www.cloudlab.us/p/utahstud/infiniband_dev
+  https://www.cloudlab.us/p/RAMCloud/infiniband_dev
   * If you don't have an account on CloudLab or Emulab,
     [see here](http://docs.cloudlab.us/getting-started.html)
   * We recommend taking the defaults for the questions you are asked about the
