@@ -43,6 +43,8 @@ static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 32;
 static const uint32_t MAX_SHARED_RX_SGE_COUNT = 1;
 static const uint32_t MAX_TX_QUEUE_DEPTH = 128;
 
+static const uint32_t MAX_TX_QUEUE_DEPTH_PER_THREAD = 4;
+
 // With 64 KB seglets 1 MB is fractured into 16 or 17 pieces, plus we
 // need an entry for the headers.
 // 31 seems to be the limit on this. Not sure why, because the qp's are
@@ -164,11 +166,13 @@ struct BufferDescriptor {
     uint32_t        bytes;          // length of buffer in bytes
     uint32_t        messageBytes;   // byte length of message in the buffer
     ibv_mr *        mr;             // memory region of the buffer
+    size_t          threadNum;      // The thread using this buffer (client)
 
-    BufferDescriptor(char *buffer, uint32_t bytes, ibv_mr *mr)
-        : buffer(buffer), bytes(bytes), messageBytes(0), mr(mr) {}
+    BufferDescriptor(char *buffer, uint32_t bytes, ibv_mr *mr, size_t threadNum)
+        : buffer(buffer), bytes(bytes), messageBytes(0), mr(mr),
+	  threadNum(threadNum) {}
     BufferDescriptor()
-        : buffer(NULL), bytes(0), messageBytes(0), mr(NULL) {}
+        : buffer(NULL), bytes(0), messageBytes(0), mr(NULL), threadNum(0) {}
 };
 
 void* rxBase;
@@ -177,8 +181,8 @@ BufferDescriptor rxDescriptors[MAX_SHARED_RX_QUEUE_DEPTH * 2];
 void* txBase;
 BufferDescriptor txDescriptors[MAX_TX_QUEUE_DEPTH];
 
-std::vector<BufferDescriptor*> freeTxBuffers{};
-RAMCloud::SpinLock freeTxBufferMutex("freeTxBuffers");
+std::vector<std::vector<BufferDescriptor*>> freeTxBuffers{};
+std::vector<RAMCloud::UnnamedSpinLock> freeTxBufferMutex;
 
 uintptr_t logMemoryBase = 0;
 size_t logMemoryBytes = 0;
@@ -358,7 +362,7 @@ QueuePair::QueuePair(ibv_qp_type type,
     qpia.srq = srq;                    // use the same shared receive queue
     qpia.cap.max_send_wr  = maxSendWr; // max outstanding send requests
     qpia.cap.max_recv_wr  = maxRecvWr; // max outstanding recv requests
-    qpia.cap.max_send_sge = 32;         // max send scatter-gather elements
+    qpia.cap.max_send_sge = 30;         // max send scatter-gather elements
     qpia.cap.max_recv_sge = 1;         // max recv scatter-gather elements
     qpia.cap.max_inline_data =         // max bytes of immediate data on send q
         MAX_INLINE_DATA;
@@ -824,7 +828,8 @@ void
 createBuffers(void** ppBase,
               BufferDescriptor descriptors[],
               uint32_t bufferSize,
-              uint32_t bufferCount)
+              uint32_t bufferCount,
+              size_t threadNum)
 {
     const size_t bytes = bufferSize * bufferCount;
     *ppBase = xmemalign(4096, bytes);
@@ -839,7 +844,8 @@ createBuffers(void** ppBase,
 
     char* buffer = static_cast<char*>(*ppBase);
     for (uint32_t i = 0; i < bufferCount; ++i) {
-        new(&descriptors[i]) BufferDescriptor(buffer, bufferSize, mr);
+        new(&descriptors[i]) BufferDescriptor(buffer, bufferSize, mr,
+		threadNum);
         buffer += bufferSize;
     }
 }
@@ -985,7 +991,7 @@ pollSocket()
  * \param hostName
  *      nullptr for clients or the hostname to listen for incoming QP reqs on.
  */
-bool setup(const char* hostName)
+bool setup(const char* hostName, size_t numThreads)
 {
     clientSetupSocket = socket(PF_INET, SOCK_DGRAM, 0);
     if (clientSetupSocket == -1) {
@@ -1090,7 +1096,7 @@ bool setup(const char* hostName)
     uint32_t bufferSize = ((1u << 23) + 4095) & ~0xfff;
 
     createBuffers(&rxBase, rxDescriptors, bufferSize,
-                  uint32_t(MAX_SHARED_RX_QUEUE_DEPTH * 2));
+                  uint32_t(MAX_SHARED_RX_QUEUE_DEPTH * 2), 0);
     uint32_t j = 0;
     for (auto& bd : rxDescriptors) {
         if (j < MAX_SHARED_RX_QUEUE_DEPTH)
@@ -1102,9 +1108,22 @@ bool setup(const char* hostName)
     //assert(numUsedClientSrqBuffers == 0);
 
     createBuffers(&txBase, txDescriptors,
-                  bufferSize, uint32_t(MAX_TX_QUEUE_DEPTH));
-    for (auto& bd : txDescriptors)
-        freeTxBuffers.push_back(&bd);
+        bufferSize, uint32_t(MAX_TX_QUEUE_DEPTH), 0);
+
+    freeTxBuffers.resize(numThreads);
+    freeTxBufferMutex.resize(numThreads);
+
+    if (hostName) {
+        for (auto& bd : txDescriptors)
+            freeTxBuffers[0].push_back(&bd);
+    } else {
+        for (size_t i = 0, j = 0; i < numThreads; ++i) {
+            for (size_t k = 0; k < MAX_TX_QUEUE_DEPTH_PER_THREAD; ++k, ++j) {
+                txDescriptors[j].threadNum = i;
+                freeTxBuffers[i].push_back(&(txDescriptors[j]));
+            }
+        }
+    }
 
     // create completion queues for server receive, client receive, and
     // server/client transmit
@@ -1171,14 +1190,17 @@ reapTxBuffers()
     ibv_wc retArray[MAX_TX_QUEUE_DEPTH];
     int n = ibv_poll_cq(commonTxCq, MAX_TX_QUEUE_DEPTH, retArray);
 
-    std::lock_guard<RAMCloud::SpinLock> lock{freeTxBufferMutex};
     for (int i = 0; i < n; i++) {
         BufferDescriptor* bd =
             reinterpret_cast<BufferDescriptor*>(retArray[i].wr_id);
         if (bd == nullptr)
             continue;
 
-        freeTxBuffers.push_back(bd);
+        size_t threadNum = bd->threadNum;
+
+        std::lock_guard<RAMCloud::UnnamedSpinLock>
+		lock{freeTxBufferMutex[threadNum]};
+        freeTxBuffers[threadNum].push_back(bd);
 
         if (retArray[i].status != IBV_WC_SUCCESS) {
             LOG(ERROR, "Transmit failed for buffer %lu: %s",
@@ -1196,15 +1218,16 @@ reapTxBuffers()
 }
 
 BufferDescriptor*
-getTransmitBuffer()
+getTransmitBuffer(size_t threadNum)
 {
     CycleCounter<> transmitCounter{&threadMetrics.getTransmitCycles};
     while (true) {
         {
-            std::lock_guard<RAMCloud::SpinLock> lock{freeTxBufferMutex};
-            if (!freeTxBuffers.empty()) {
-                BufferDescriptor* bd = freeTxBuffers.back();
-                freeTxBuffers.pop_back();
+            std::lock_guard<RAMCloud::UnnamedSpinLock>
+	        lock{freeTxBufferMutex[threadNum]};
+            if (!freeTxBuffers[threadNum].empty()) {
+                BufferDescriptor* bd = freeTxBuffers[threadNum].back();
+                freeTxBuffers[threadNum].pop_back();
                 return bd;
             }
         }
@@ -1222,9 +1245,10 @@ void
 sendStrictZeroCopy(Chunk* message,
                    uint32_t chunkCount,
                    uint32_t messageLen,
-                   QueuePair* qp)
+                   QueuePair* qp,
+                   size_t threadNum)
 {
-    BufferDescriptor* bd = getTransmitBuffer();
+    BufferDescriptor* bd = getTransmitBuffer(threadNum);
     bd->messageBytes = messageLen;
 
     ibv_sge isge[MAX_TX_SGE_COUNT];
@@ -1290,9 +1314,10 @@ void
 sendStrictCopy(Chunk* message,
                uint32_t chunkCount,
                uint32_t messageLen,
-               QueuePair* qp)
+               QueuePair* qp,
+               size_t threadNum)
 {
-    BufferDescriptor* bd = getTransmitBuffer();
+    BufferDescriptor* bd = getTransmitBuffer(threadNum);
     bd->messageBytes = messageLen;
 
     {
@@ -1341,9 +1366,9 @@ sendStrictCopy(Chunk* message,
 }
 
 void
-sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp, bool allowZeroCopy)
+sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp, bool allowZeroCopy, size_t threadNum)
 {
-    BufferDescriptor* bd = getTransmitBuffer();
+    BufferDescriptor* bd = getTransmitBuffer(threadNum);
     bd->messageBytes = messageLen;
 
     uint32_t chunksUsed = 0;
@@ -1767,9 +1792,9 @@ poll()
     // until buffers are running low before trying to reclaim.  This
     // optimization improves the throughput of "clusterperf readThroughput"
     // by about 5% (as of 7/2015).
-    if (freeTxBuffers.size() < 3) {
+    if (freeTxBuffers[0].size() < 3) {
         reapTxBuffers();
-        if (freeTxBuffers.size() >= 3) {
+        if (freeTxBuffers[0].size() >= 3) {
             foundWork = 1;
         }
     }
@@ -1864,8 +1889,10 @@ class Benchmark {
         for (auto& thread : threads)
             thread.join();
 
-        while (freeTxBuffers.size() < MAX_TX_QUEUE_DEPTH)
-            reapTxBuffers();
+        for (size_t i = 0; i < servers.size(); ++i) {
+            while (freeTxBuffers[i].size() < MAX_TX_QUEUE_DEPTH_PER_THREAD)
+                reapTxBuffers();
+        }
     }
 
     void entry(size_t threadNum, ThreadState* threadState) {
@@ -1897,14 +1924,14 @@ class Benchmark {
         while (!go);
 
         // warmup
-        run(threadState, warmupSeconds);
+        run(threadState, warmupSeconds, threadNum);
 
         threadMetrics.reset();
 
         uint64_t cycles = 0;
         {
             CycleCounter<> counter{&cycles};
-            run(threadState, seconds);
+            run(threadState, seconds, threadNum);
         }
 
         threadMetrics.dump(!doZeroCopy, threadState->qp->getPeerName(),
@@ -1924,22 +1951,24 @@ class Benchmark {
         }
     }
 
-    void run(ThreadState* threadState, double seconds) {
+    void run(ThreadState* threadState, double seconds, size_t threadNum) {
         const uint64_t cyclesToRun = Cycles::fromSeconds(seconds);
         const uint64_t start = Cycles::rdtsc();
         while (true) {
             //sendZeroCopy(&threadState->chunks[0], nChunks, nChunks * chunkSize,
-            //             threadState->qp.get(), doZeroCopy);
+            //             threadState->qp.get(), doZeroCopy, threadNum);
             if (doZeroCopy) {
                 sendStrictZeroCopy(&threadState->chunks[0],
                                    nDeltas + nChunks,
                                    nDeltas * deltaSize + nChunks * chunkSize,
-                                   threadState->qp.get());
+                                   threadState->qp.get(),
+                                   threadNum);
             } else {
                 sendStrictCopy(&threadState->chunks[0],
                                nDeltas + nChunks,
                                nDeltas * deltaSize + nChunks * chunkSize,
-                               threadState->qp.get());
+                               threadState->qp.get(),
+                               threadNum);
             }
             if (Cycles::rdtsc() - start > cyclesToRun)
                 break;
@@ -2025,7 +2054,8 @@ int main(int argc, const char** argv)
         LOG(INFO, " > %s", hostName.c_str());
     LOG(INFO, "Number of client server connections: %lu", hostNames.size());
 
-    setup(isServer ? hostNames.at(0).c_str() : nullptr);
+    setup(isServer ? hostNames.at(0).c_str() : nullptr,
+        isServer ? 1 : hostNames.size());
     // Allocate a GB and register it with the HCA.
     LOG(INFO, "Registering log memory");
     void* base = nullptr;
@@ -2093,7 +2123,7 @@ int main(int argc, const char** argv)
         // too.
         for (size_t deltaSize : sizes)
         {
-            for (size_t nDeltas = 0; nDeltas <= 31; ++nDeltas)
+            for (size_t nDeltas = 0; nDeltas <= 29; ++nDeltas)
             {
                 {
                     LOG(INFO, "Running Deltas on #deltas: %lu size: %lu",
