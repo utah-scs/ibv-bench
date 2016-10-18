@@ -31,6 +31,7 @@ class BenchmarkRunner(object):
         self.server = server
         self.node_names = []
         self.host_names = []
+        self.public_names = []
         self.start_time = None
         self.end_time = None
 
@@ -57,8 +58,10 @@ class BenchmarkRunner(object):
           if child.tag.endswith('node'):
             for host in child.getchildren():
               if host.tag.endswith('host'):
-                self.host_names.append(host.get('name'))
+                self.host_names.append("chinmayk@" + host.get('name'))
                 self.node_names.append('node-%d' % len(self.node_names))
+              if host.tag.endswith('vnode'):
+                self.public_names.append(host.get('name') + ".apt.emulab.net")
               if self.node_type is None and host.tag.endswith('hardware_type'):
                 self.node_type = host.get('name')
 
@@ -117,7 +120,7 @@ class BenchmarkRunner(object):
 
     def start_servers(self):
         procs = []
-        for host, node in zip(self.host_names[1:], self.node_names[1:]):
+        for host, node in zip(self.host_names[1:], self.public_names[1:]):
             cmd = ('(cd ibv-bench; ./ibv-bench server %s %s > server_%s.log 2>&1)' %
                         (node, self.extra_server_args, node))
             logger.debug("Starting server with cmd:%s", cmd)
@@ -185,7 +188,7 @@ class BenchmarkRunner(object):
             ssh(self.host_names[0],
                 '(cd ibv-bench; ' +
                 './ibv-bench client %s %s 2>&1 > %s-out.log | tee %s-err.log)'
-                    % (' '.join(self.node_names[1:]),
+                    % (' '.join(self.public_names[1:]),
                        self.extra_client_args,
                        self.get_name(),
                        self.get_name()))
