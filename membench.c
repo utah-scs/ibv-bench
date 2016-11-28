@@ -59,6 +59,7 @@ init() {
                 break;
             }
         }
+	printf("cyclespersec:%lf",cyclesPerSec);
         double delta = cyclesPerSec/1000.0;
         if ((oldCycles > (cyclesPerSec - delta)) &&
                 (oldCycles < (cyclesPerSec + delta))) {
@@ -84,10 +85,10 @@ main()
 
     void* left = base;
     void* right = (char*)base + (1lu << 29);
-
+    int i;
     const int iters = 100;
     uint64_t start = rdtsc();
-    for (int i = 0; i < iters; ++i) {
+    for (i = 0; i < iters; ++i) {
         memcpy(left, right, (1lu << 29));
     }
     uint64_t end = rdtsc();

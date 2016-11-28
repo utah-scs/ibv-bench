@@ -23,7 +23,7 @@ def ssh(server, cmd, checked=True):
 
 class BenchmarkRunner(object):
 
-    def __init__(self, server, extra_args, num_clients=None):
+    def __init__(self, server, extra_args, user="", num_clients=None):
         self.num_clients = num_clients
         self.extra_server_args = '--hugePages'
         self.extra_client_args = extra_args + ' --hugePages'
@@ -34,6 +34,7 @@ class BenchmarkRunner(object):
         self.public_names = []
         self.start_time = None
         self.end_time = None
+	self.user = user
 
     def __enter__(self):
         self.populate_hosts()
@@ -58,7 +59,7 @@ class BenchmarkRunner(object):
           if child.tag.endswith('node'):
             for host in child.getchildren():
               if host.tag.endswith('host'):
-                self.host_names.append("chinmayk@" + host.get('name'))
+                self.host_names.append(self.user + host.get('name'))
                 self.node_names.append('node-%d' % len(self.node_names))
               if host.tag.endswith('vnode'):
                 self.public_names.append(host.get('name') + ".apt.emulab.net")
@@ -231,7 +232,7 @@ def main():
     loglevel=getattr(logging, args.log_level.upper(), "INFO")
     logging.basicConfig(level=loglevel)
     
-    with BenchmarkRunner(server, extra_args, num_clients=num_clients) as br:
+    with BenchmarkRunner(server, extra_args, args.user, num_clients=num_clients) as br:
         logger.info('Found hosts %s' % ' '.join(br.host_names))
         cmd = args.cmd
         if cmd == 'run':

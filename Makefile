@@ -15,10 +15,13 @@ docopt.o : docopt.cpp/docopt.cpp
 
 %.o : %.cc
 	$(CXX) $(CXXFLAGS) -c $<
+mem-bench: membench.c
+	gcc -std=c++14 -O3 -o mem-bench membench.c
+
 
 .PHONY: clean
 clean:
-	-rm *.o ibv-bench
+	-rm *.o ibv-bench mem-bench
 
-all: ibv-bench
+all: ibv-bench mem-bench 
 
