@@ -23,7 +23,7 @@ def ssh(server, cmd, checked=True):
 
 class BenchmarkRunner(object):
 
-    def __init__(self, server, extra_args, user="", num_clients=None):
+    def __init__(self, server, extra_args, user=None, num_clients=None):
         self.num_clients = num_clients
         self.extra_server_args = '--hugePages'
         self.extra_client_args = extra_args + ' --hugePages'
@@ -34,7 +34,7 @@ class BenchmarkRunner(object):
         self.public_names = []
         self.start_time = None
         self.end_time = None
-	self.user = user
+	self.user = user if user else ""
 
     def __enter__(self):
         self.populate_hosts()
