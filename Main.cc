@@ -2089,7 +2089,7 @@ int main(int argc, const char** argv)
         for (size_t chunkSize : sizes)
         {
             for (size_t nChunks = minChunksPerMessage;
-                 nChunks <= maxChunksPerMessage && nChunks <= 32;
+                 nChunks <= maxChunksPerMessage && nChunks <= 30;
                  ++nChunks)
             {
                 {
