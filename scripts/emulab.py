@@ -23,7 +23,7 @@ def ssh(server, cmd, checked=True):
 
 class BenchmarkRunner(object):
 
-    def __init__(self, server, extra_args, user=None, num_clients=None):
+    def __init__(self, server, extra_args, user=None, profile=None, num_clients=None):
         self.num_clients = num_clients
         self.extra_server_args = '--hugePages'
         self.extra_client_args = extra_args + ' --hugePages'
@@ -35,6 +35,7 @@ class BenchmarkRunner(object):
         self.start_time = None
         self.end_time = None
 	self.user = user if user else ""
+	self.profile = False if profile is None else True 
 
     def __enter__(self):
         self.populate_hosts()
@@ -181,18 +182,31 @@ class BenchmarkRunner(object):
                 self.compile_code(host)
 
             procs = self.start_servers()
-
-            time.sleep(5)
+	    time.sleep(5)
+	    if self.profile:
+	        logger.info("running with profiler")
+		ssh(self.host_names[0], 'sudo su -c \'echo -1 > /proc/sys/kernel/perf_event_paranoid\'')
+	        client_cmd = ('(cd ibv-bench; python pmu-tools/ucevent/ucevent.py' +
+                		' -I 60000 -o %s-membw.csv -x, --scale GB' % self.get_name() +
+                		' iMC.MEM_BW_TOTAL -- sh -c \'./ibv-bench' +
+				' client %s %s 2>&1 > %s-out.log | tee %s-err.log\')'
+				% (' '.join(self.public_names[1:]),
+                		self.extra_client_args,
+               			self.get_name(),
+                		self.get_name()))
+	    else:
+		logger.info("Running without profiler")
+		client_cmd = ('(cd ibv-bench; ' +
+                                './ibv-bench client %s %s 2>&1 > %s-out.log | tee %s-err.log)'
+                                % (' '.join(self.public_names[1:]),
+                                self.extra_client_args,
+                                self.get_name(),
+                                self.get_name()))
 
             logger.info("Starting client processes; " +
                         "benchmarks will take a few hours.")
-            ssh(self.host_names[0],
-                '(cd ibv-bench; ' +
-                './ibv-bench client %s %s 2>&1 > %s-out.log | tee %s-err.log)'
-                    % (' '.join(self.public_names[1:]),
-                       self.extra_client_args,
-                       self.get_name(),
-                       self.get_name()))
+            ssh(self.host_names[0], client_cmd)
+
         finally:
             self.end_time = datetime.datetime.now()
             logger.info("Collecting results ...")
@@ -219,6 +233,8 @@ def main():
     optionals.add_argument("--user", default=None,
                            help="Cloudlab username if different from the " +
                                 "current user")
+    optionals.add_argument("--profile", default=None,
+			   help="Profile memory bandwidth using pmu-tools")
     args, unknowns = parser.parse_known_args()
 
     subprocess.check_call('git submodule init', shell=True, stdout=sys.stdout)
@@ -232,7 +248,7 @@ def main():
     loglevel=getattr(logging, args.log_level.upper(), "INFO")
     logging.basicConfig(level=loglevel)
     
-    with BenchmarkRunner(server, extra_args, args.user, num_clients=num_clients) as br:
+    with BenchmarkRunner(server, extra_args, args.user, args.profile, num_clients=num_clients) as br:
         logger.info('Found hosts %s' % ' '.join(br.host_names))
         cmd = args.cmd
         if cmd == 'run':
