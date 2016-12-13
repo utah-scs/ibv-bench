@@ -23,7 +23,7 @@ def ssh(server, cmd, checked=True):
 
 class BenchmarkRunner(object):
 
-    def __init__(self, server, extra_args, user=None, profile=None, num_clients=None):
+    def __init__(self, server, extra_args, user=None, profile=None, binary="ibv-bench", num_clients=None):
         self.num_clients = num_clients
         self.extra_server_args = '--hugePages'
         self.extra_client_args = extra_args + ' --hugePages'
@@ -36,6 +36,7 @@ class BenchmarkRunner(object):
         self.end_time = None
 	self.user = user if user else ""
 	self.profile = False if profile is None else True 
+	self.binary = binary
 
     def __enter__(self):
         self.populate_hosts()
@@ -123,8 +124,8 @@ class BenchmarkRunner(object):
     def start_servers(self):
         procs = []
         for host, node in zip(self.host_names[1:], self.public_names[1:]):
-            cmd = ('(cd ibv-bench; ./ibv-bench server %s %s > server_%s.log 2>&1)' %
-                        (node, self.extra_server_args, node))
+            cmd = ('(cd ibv-bench; ./%s server %s %s > server_%s.log 2>&1)' %
+                        (self.binary, node, self.extra_server_args, node))
             logger.debug("Starting server with cmd:%s", cmd)
             procs.append(subprocess.Popen(['ssh', host, cmd]))
         return procs
@@ -132,7 +133,7 @@ class BenchmarkRunner(object):
     def killall(self):
         for host in self.host_names:
             logger.debug("Killing processes on %s",host)
-            ssh(host, 'pkill -9 ibv-bench', checked=False)
+            ssh(host, 'pkill -9 %s' % self.binary, checked=False)
 
     def update_limits(self, server):
         logger.debug("Updating pinning limits")
@@ -188,7 +189,7 @@ class BenchmarkRunner(object):
 		ssh(self.host_names[0], 'sudo su -c \'echo -1 > /proc/sys/kernel/perf_event_paranoid\'')
 	        client_cmd = ('(cd ibv-bench; python pmu-tools/ucevent/ucevent.py' +
                 		' -I 60000 -o %s-membw.csv -x, --scale GB' % self.get_name() +
-                		' iMC.MEM_BW_TOTAL -- sh -c \'./ibv-bench' +
+                		' iMC.MEM_BW_TOTAL -- sh -c \'./%s' % self.binary +
 				' client %s %s 2>&1 > %s-out.log | tee %s-err.log\')'
 				% (' '.join(self.public_names[1:]),
                 		self.extra_client_args,
@@ -197,8 +198,8 @@ class BenchmarkRunner(object):
 	    else:
 		logger.info("Running without profiler")
 		client_cmd = ('(cd ibv-bench; ' +
-                                './ibv-bench client %s %s 2>&1 > %s-out.log | tee %s-err.log)'
-                                % (' '.join(self.public_names[1:]),
+                                './%s client %s %s 2>&1 > %s-out.log | tee %s-err.log)'
+                                % (self.binary, ' '.join(self.public_names[1:]),
                                 self.extra_client_args,
                                 self.get_name(),
                                 self.get_name()))
@@ -235,6 +236,8 @@ def main():
                                 "current user")
     optionals.add_argument("--profile", default=None,
 			   help="Profile memory bandwidth using pmu-tools")
+    optionals.add_argument("--nosend", default=False,
+			   help="Don't send data")
     args, unknowns = parser.parse_known_args()
 
     subprocess.check_call('git submodule init', shell=True, stdout=sys.stdout)
@@ -243,12 +246,16 @@ def main():
         server = args.hostname[0]
     else:
         server = args.user+"@"+args.hostname[0]
+    if not args.nosend:
+	binary = "nosend"
+    else:
+	binary = "ibv-bench"
     num_clients = args.clients
     extra_args = " ".join(unknowns)
     loglevel=getattr(logging, args.log_level.upper(), "INFO")
     logging.basicConfig(level=loglevel)
     
-    with BenchmarkRunner(server, extra_args, args.user, args.profile, num_clients=num_clients) as br:
+    with BenchmarkRunner(server, extra_args, args.user, args.profile, binary, num_clients=num_clients) as br:
         logger.info('Found hosts %s' % ' '.join(br.host_names))
         cmd = args.cmd
         if cmd == 'run':
