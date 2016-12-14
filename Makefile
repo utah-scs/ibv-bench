@@ -1,7 +1,7 @@
 CXXFLAGS := -std=c++14 -O3 -Idocopt.cpp -Wall -Werror
 LDFLAGS := -libverbs -lpthread
 
-SRCS := $(wildcard *.cc)
+SRCS := $(filter-out nosend.cc, $(wildcard *.cc))
 OBJS := $(patsubst %.cc, %.o, $(SRCS)) docopt.o
 
 ibv-bench: $(OBJS)
@@ -15,13 +15,13 @@ docopt.o : docopt.cpp/docopt.cpp
 
 %.o : %.cc
 	$(CXX) $(CXXFLAGS) -c $<
-mem-bench: membench.c
-	gcc -std=c++14 -O3 -o mem-bench membench.c
 
+nosend : nosend.o IpAddress.o Common.o Cycles.o SpinLock.o LargeBlockOfMemory.o docopt.o
+	g++ IpAddress.o Common.o Cycles.o SpinLock.o LargeBlockOfMemory.o docopt.o nosend.o -o nosend -libverbs -lpthread
 
 .PHONY: clean
 clean:
-	-rm *.o ibv-bench mem-bench
+	-rm *.o ibv-bench nosend
 
-all: ibv-bench mem-bench 
+all: ibv-bench nosend 
 

@@ -119,7 +119,7 @@ class BenchmarkRunner(object):
 
     def compile_code(self, server):
         logger.info("Compiling code on %s", server)
-        ssh(server, '(cd ibv-bench; (make clean; make -j 8) &> ~/ibv-bench/build.log)')
+        ssh(server, '(cd ibv-bench; (make clean; make all -j 8) &> ~/ibv-bench/build.log)')
 
     def start_servers(self):
         procs = []
@@ -247,9 +247,9 @@ def main():
     else:
         server = args.user+"@"+args.hostname[0]
     if not args.nosend:
-	binary = "nosend"
-    else:
 	binary = "ibv-bench"
+    else:
+	binary = "nosend"
     num_clients = args.clients
     extra_args = " ".join(unknowns)
     loglevel=getattr(logging, args.log_level.upper(), "INFO")
