@@ -2092,6 +2092,7 @@ int main(int argc, const char** argv)
                  nChunks <= maxChunksPerMessage && nChunks <= 30;
                  ++nChunks)
             {
+		sleep(5);
                 {
                     LOG(INFO, "Running Zero Copy on #chunks: %lu size: %lu",
                             nChunks, chunkSize);
@@ -2099,6 +2100,7 @@ int main(int argc, const char** argv)
                                     true /* 0-copy */, seconds, warmupSeconds};
                     bench.start();
                 }
+		sleep(5);
                 {
                     LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
                             nChunks, chunkSize);
@@ -2111,6 +2113,7 @@ int main(int argc, const char** argv)
             for (size_t nChunks = 64; nChunks <= maxChunksPerMessage; nChunks *=2) {
                 LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
                         nChunks, chunkSize);
+		sleep(5);
                 Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
                                 false /* doZeroCopy */, seconds, warmupSeconds};
                 bench.start();
