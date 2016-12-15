@@ -188,7 +188,7 @@ class BenchmarkRunner(object):
 	        logger.info("running with profiler")
 		ssh(self.host_names[0], 'sudo su -c \'echo -1 > /proc/sys/kernel/perf_event_paranoid\'')
 	        client_cmd = ('(cd ibv-bench; python pmu-tools/ucevent/ucevent.py' +
-                		' -I 100 -o %s-membw.csv -x, --scale GB' % self.get_name() +
+                		' -I 100 -o %s-membw.csv -x, --scale MB' % self.get_name() +
                 		' iMC.MEM_BW_TOTAL -- sh -c \'./%s' % self.binary +
 				' client %s %s 2>&1 > %s-out.log | tee %s-err.log\')'
 				% (' '.join(self.public_names[1:]),
