@@ -2092,38 +2092,64 @@ int main(int argc, const char** argv)
                  nChunks <= maxChunksPerMessage && nChunks <= 30;
                  ++nChunks)
             {
-		sleep(5);
+               /*
                 {
                     LOG(INFO, "Running Zero Copy on #chunks: %lu size: %lu",
                             nChunks, chunkSize);
                     Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
-                                    true /* 0-copy */, seconds, warmupSeconds};
+                                    true  0-copy , seconds, warmupSeconds};
                     bench.start();
                 }
-		sleep(5);
+		*/
                 {
                     LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
                             nChunks, chunkSize);
                     Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
-                                    false /* no 0-copy */, seconds, warmupSeconds};
+                                    true/* no 0-copy */, seconds, warmupSeconds};
                     bench.start();
                 }
             }
-            // Power of 2 number of chunks
+	  sleep(300);
+	  for (size_t nChunks = minChunksPerMessage;
+                 nChunks <= maxChunksPerMessage && nChunks <= 30;
+                 ++nChunks)
+            {
+               /*
+                {
+                    LOG(INFO, "Running Zero Copy on #chunks: %lu size: %lu",
+                            nChunks, chunkSize);
+                    Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
+                                    true  0-copy , seconds, warmupSeconds};
+                    bench.start();
+                }
+		*/
+                {
+                    LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
+                            nChunks, chunkSize);
+                    Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
+                                    false/* no 0-copy */, seconds, warmupSeconds};
+                    bench.start();
+                }
+            }
+
+/*            // Power of 2 number of chunks
             for (size_t nChunks = 64; nChunks <= maxChunksPerMessage; nChunks *=2) {
                 LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
                         nChunks, chunkSize);
 		sleep(5);
                 Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
-                                false /* doZeroCopy */, seconds, warmupSeconds};
+         //                       false  doZeroCopy , seconds, warmupSeconds};
                 bench.start();
             }
+*/
         }
 
         // Delta record tests. For these we use the command line args for
         // number of chunks for the deltas instead, and we just included a 16
         // KB base page in each trasmission no matter what.  It's all zero-copy
         // too.
+
+/*
         for (size_t deltaSize : sizes)
         {
             for (size_t nDeltas = 0; nDeltas <= 29; ++nDeltas)
@@ -2132,11 +2158,12 @@ int main(int argc, const char** argv)
                     LOG(INFO, "Running Deltas on #deltas: %lu size: %lu",
                             nDeltas, deltaSize);
                     Benchmark bench{hostNames, 1, 16384, nDeltas, deltaSize,
-                                    true /* 0-copy */, seconds, warmupSeconds};
+                                    true / 0-copy /, seconds, warmupSeconds};
                     bench.start();
                 }
             }
         }
+*/
     }
 
     return 0;
