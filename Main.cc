@@ -362,7 +362,7 @@ QueuePair::QueuePair(ibv_qp_type type,
     qpia.srq = srq;                    // use the same shared receive queue
     qpia.cap.max_send_wr  = maxSendWr; // max outstanding send requests
     qpia.cap.max_recv_wr  = maxRecvWr; // max outstanding recv requests
-    qpia.cap.max_send_sge = 30;         // max send scatter-gather elements
+    qpia.cap.max_send_sge = 32;         // max send scatter-gather elements
     qpia.cap.max_recv_sge = 1;         // max recv scatter-gather elements
     qpia.cap.max_inline_data =         // max bytes of immediate data on send q
         MAX_INLINE_DATA;
@@ -2082,47 +2082,26 @@ int main(int argc, const char** argv)
 
         ThreadMetrics::dumpHeader();
 
-        //for (size_t chunkSize = minChunkSize;
-        //     chunkSize <= maxChunkSize;
-        //     chunkSize *= 2)
-        const std::vector<size_t> sizes{128, 1024};
-        for (size_t chunkSize : sizes)
+        for (size_t chunkSize = minChunkSize;
+             chunkSize <= maxChunkSize;
+             chunkSize *= 2)
+       // const std::vector<size_t> sizes{128, 1024};
+       // for (size_t chunkSize : sizes)
         {
-            for (size_t nChunks = minChunksPerMessage;
-                 nChunks <= maxChunksPerMessage && nChunks <= 30;
-                 ++nChunks)
-            {
-               /*
-                {
-                    LOG(INFO, "Running Zero Copy on #chunks: %lu size: %lu",
-                            nChunks, chunkSize);
-                    Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
-                                    true  0-copy , seconds, warmupSeconds};
-                    bench.start();
-                }
-		*/
-                {
-                    LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
-                            nChunks, chunkSize);
-                    Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
-                                    true/* no 0-copy */, seconds, warmupSeconds};
-                    bench.start();
-                }
-            }
-	  sleep(300);
+            
 	  for (size_t nChunks = minChunksPerMessage;
-                 nChunks <= maxChunksPerMessage && nChunks <= 30;
+                 nChunks <= maxChunksPerMessage && nChunks <= 32;
                  ++nChunks)
             {
-               /*
+               
                 {
                     LOG(INFO, "Running Zero Copy on #chunks: %lu size: %lu",
                             nChunks, chunkSize);
                     Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
-                                    true  0-copy , seconds, warmupSeconds};
+                                    true /* 0-copy */ , seconds, warmupSeconds};
                     bench.start();
                 }
-		*/
+	         sleep(seconds);	
                 {
                     LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
                             nChunks, chunkSize);
