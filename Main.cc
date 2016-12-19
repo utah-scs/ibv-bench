@@ -9,6 +9,7 @@
 #include <cassert>
 #include <deque>
 #include <atomic>
+#include <time.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -21,6 +22,7 @@
 #include <iostream>
 #include <map>
 #include <algorithm>
+#include <unordered_map>
 
 #include "docopt.h"
 
@@ -212,6 +214,64 @@ void pinAllMemory() {
     }
 }
 
+// XXX Lobotomized from RAMCloud/src/ClusterPerf.cc
+class ZipfianGenerator {
+  public:
+    /**
+     * Construct a generator.  This may be expensive if n is large.
+     *
+     * \param n
+     *      The generator will output random numbers between 0 and n-1.
+     * \param theta
+     *      The zipfian parameter where 0 < theta < 1 defines the skew; the
+     *      smaller the value the more skewed the distribution will be. Default
+     *      value of 0.99 comes from the YCSB default value.
+     */
+    explicit ZipfianGenerator(uint64_t n, double theta = 0.99)
+        : n(n)
+        , theta(theta)
+        , alpha(1 / (1 - theta))
+        , zetan(zeta(n, theta))
+        , eta((1 - pow(2.0 / static_cast<double>(n), 1 - theta)) /
+              (1 - zeta(2, theta) / zetan))
+    {}
+
+    /**
+     * Return the zipfian distributed random number between 0 and n-1.
+     */
+    uint64_t nextNumber()
+    {
+        double u = static_cast<double>(generateRandom()) /
+                   static_cast<double>(~0UL);
+        double uz = u * zetan;
+        if (uz < 1)
+            return 0;
+        if (uz < 1 + std::pow(0.5, theta))
+            return 1;
+        return 0 + static_cast<uint64_t>(static_cast<double>(n) *
+                                         std::pow(eta*u - eta + 1.0, alpha));
+    }
+
+  private:
+    const uint64_t n;       // Range of numbers to be generated.
+    const double theta;     // Parameter of the zipfian distribution.
+    const double alpha;     // Special intermediate result used for generation.
+    const double zetan;     // Special intermediate result used for generation.
+    const double eta;       // Special intermediate result used for generation.
+
+    /**
+     * Returns the nth harmonic number with parameter theta; e.g. H_{n,theta}.
+     */
+    static double zeta(uint64_t n, double theta)
+    {
+        double sum = 0;
+        for (uint64_t i = 0; i < n; i++) {
+            sum = sum + 1.0/(std::pow(i+1, theta));
+        }
+        return sum;
+    }
+};
+
 // XXX Lobotomized for now.
 class Address {
     int physicalPort;   // physical port number on local device
@@ -362,7 +422,7 @@ QueuePair::QueuePair(ibv_qp_type type,
     qpia.srq = srq;                    // use the same shared receive queue
     qpia.cap.max_send_wr  = maxSendWr; // max outstanding send requests
     qpia.cap.max_recv_wr  = maxRecvWr; // max outstanding recv requests
-    qpia.cap.max_send_sge = 32;         // max send scatter-gather elements
+    qpia.cap.max_send_sge = 30;        // max send scatter-gather elements
     qpia.cap.max_recv_sge = 1;         // max recv scatter-gather elements
     qpia.cap.max_inline_data =         // max bytes of immediate data on send q
         MAX_INLINE_DATA;
@@ -1906,11 +1966,23 @@ class Benchmark {
         threadState->chunks.resize(nDeltas + nChunks);
         uint32_t start = 0;
 
+        bool preTouchChunks = false;
+        bool runSimulateWorkload = true;
+
+        std::unordered_map<int, uintptr_t> ramCloudHashTable;
+
+        ramCloudHashTable.rehash(logSize/chunkSize);
+
         for (size_t i = 0; i < nDeltas; ++i) {
             start = generateRandom();
             start = start % (logSize - deltaSize);
             threadState->chunks[i].p = (void*)(logMemoryBase + start);
             threadState->chunks[i].len = deltaSize;
+
+            if (preTouchChunks == true) {
+                memset(threadState->chunks[i].p, nDeltas + deltaSize,
+                    threadState->chunks[i].len);
+            }
         }
 
         for (size_t i = 0; i < nChunks; ++i) {
@@ -1918,6 +1990,21 @@ class Benchmark {
             start = start % (logSize - chunkSize);
             threadState->chunks[i].p = (void*)(logMemoryBase + start);
             threadState->chunks[i].len = chunkSize;
+
+            if (preTouchChunks == true) {
+                memset(threadState->chunks[i].p, nChunks + chunkSize,
+                    threadState->chunks[i].len);
+            }
+
+            if (runSimulateWorkload == true) {
+                ramCloudHashTable[i] = logMemoryBase + start;
+            }
+        }
+
+        // If this is a migration test, perform a few operations (reads and
+        // writes) before proceeding.
+        if (deltaSize == 0 && runSimulateWorkload == true) {
+            simulateWorkload(threadState, ramCloudHashTable);
         }
 
         nReady++;
@@ -1951,10 +2038,53 @@ class Benchmark {
         }
     }
 
+    void simulateWorkload(ThreadState* threadState,
+        std::unordered_map<int, uintptr_t> ramCloudHashTable) {
+        double theta = 0.5;
+        int writePercent = 100;
+        int numOperations = 100;
+        ZipfianGenerator generator(nChunks, theta);
+
+        srand(time(NULL));
+
+        for (int i = 0; i < numOperations; i++) {
+            uint64_t lookupRecord = generator.nextNumber();
+            uintptr_t recordAddress = 0;
+
+            if (rand() % 100 < 100 - writePercent) {
+                // Perform a hash table lookup only.
+                recordAddress = ramCloudHashTable[lookupRecord];
+            } else {
+                recordAddress = ramCloudHashTable[lookupRecord];
+                memset((void*)recordAddress, i + recordAddress, chunkSize);
+            }
+        }
+    }
+
     void run(ThreadState* threadState, double seconds, size_t threadNum) {
         const uint64_t cyclesToRun = Cycles::fromSeconds(seconds);
-        const uint64_t start = Cycles::rdtsc();
+        const uint64_t startTsc = Cycles::rdtsc();
+
+        bool refreshChunks = true;
+        uint32_t start = 0;
+
         while (true) {
+            if (refreshChunks == true) {
+                for (size_t i = 0; i < nDeltas; ++i) {
+                    start = generateRandom();
+                    start = start % (logSize - deltaSize);
+                    threadState->chunks[i].p = (void*)(logMemoryBase + start);
+                    threadState->chunks[i].len = deltaSize;
+                }
+
+                for (size_t i = 0; i < nChunks; ++i) {
+                    start = generateRandom();
+                    start = start % (logSize - chunkSize);
+                    threadState->chunks[i].p = (void*)(logMemoryBase + start);
+                    threadState->chunks[i].len = chunkSize;
+                }
+            }
+
             //sendZeroCopy(&threadState->chunks[0], nChunks, nChunks * chunkSize,
             //             threadState->qp.get(), doZeroCopy, threadNum);
             if (doZeroCopy) {
@@ -1970,7 +2100,7 @@ class Benchmark {
                                threadState->qp.get(),
                                threadNum);
             }
-            if (Cycles::rdtsc() - start > cyclesToRun)
+            if (Cycles::rdtsc() - startTsc > cyclesToRun)
                 break;
         }
     }
@@ -2083,52 +2213,45 @@ int main(int argc, const char** argv)
         ThreadMetrics::dumpHeader();
 
         for (size_t chunkSize = minChunkSize;
-             chunkSize <= maxChunkSize;
-             chunkSize *= 2)
-       // const std::vector<size_t> sizes{128, 1024};
-       // for (size_t chunkSize : sizes)
+            chunkSize <= maxChunkSize;
+            chunkSize *= 2)
+        // const std::vector<size_t> sizes{128, 1024};
+        // for (size_t chunkSize : sizes)
         {
-            
-	  for (size_t nChunks = minChunksPerMessage;
+            for (size_t nChunks = minChunksPerMessage;
                  nChunks <= maxChunksPerMessage && nChunks <= 32;
                  ++nChunks)
             {
-               
                 {
                     LOG(INFO, "Running Zero Copy on #chunks: %lu size: %lu",
                             nChunks, chunkSize);
                     Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
-                                    true /* 0-copy */ , seconds, warmupSeconds};
+                                    true /* 0-copy */, seconds, warmupSeconds};
                     bench.start();
                 }
-	         sleep(seconds);	
+                sleep(seconds);
                 {
                     LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
                             nChunks, chunkSize);
                     Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
-                                    false/* no 0-copy */, seconds, warmupSeconds};
+                                    false /* no 0-copy */, seconds, warmupSeconds};
                     bench.start();
                 }
             }
-
-/*            // Power of 2 number of chunks
-            for (size_t nChunks = 64; nChunks <= maxChunksPerMessage; nChunks *=2) {
-                LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
-                        nChunks, chunkSize);
-		sleep(5);
-                Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
-         //                       false  doZeroCopy , seconds, warmupSeconds};
-                bench.start();
-            }
-*/
+            // Power of 2 number of chunks
+            // for (size_t nChunks = 64; nChunks <= maxChunksPerMessage; nChunks *=2) {
+            //     LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
+            //             nChunks, chunkSize);
+            //     Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
+            //                     false /* doZeroCopy */, seconds, warmupSeconds};
+            //     bench.start();
+            // }
         }
 
         // Delta record tests. For these we use the command line args for
         // number of chunks for the deltas instead, and we just included a 16
         // KB base page in each trasmission no matter what.  It's all zero-copy
         // too.
-
-/*
         for (size_t deltaSize : sizes)
         {
             for (size_t nDeltas = 0; nDeltas <= 29; ++nDeltas)
@@ -2137,12 +2260,11 @@ int main(int argc, const char** argv)
                     LOG(INFO, "Running Deltas on #deltas: %lu size: %lu",
                             nDeltas, deltaSize);
                     Benchmark bench{hostNames, 1, 16384, nDeltas, deltaSize,
-                                    true / 0-copy /, seconds, warmupSeconds};
+                                    true /* 0-copy */, seconds, warmupSeconds};
                     bench.start();
                 }
             }
         }
-*/
     }
 
     return 0;
