@@ -422,7 +422,7 @@ QueuePair::QueuePair(ibv_qp_type type,
     qpia.srq = srq;                    // use the same shared receive queue
     qpia.cap.max_send_wr  = maxSendWr; // max outstanding send requests
     qpia.cap.max_recv_wr  = maxRecvWr; // max outstanding recv requests
-    qpia.cap.max_send_sge = 30;        // max send scatter-gather elements
+    qpia.cap.max_send_sge = 32;        // max send scatter-gather elements
     qpia.cap.max_recv_sge = 1;         // max recv scatter-gather elements
     qpia.cap.max_inline_data =         // max bytes of immediate data on send q
         MAX_INLINE_DATA;
@@ -1967,7 +1967,7 @@ class Benchmark {
         uint32_t start = 0;
 
         bool preTouchChunks = false;
-        bool runSimulateWorkload = true;
+        bool runSimulateWorkload = false;
 
         std::unordered_map<int, uintptr_t> ramCloudHashTable;
 
@@ -2229,7 +2229,7 @@ int main(int argc, const char** argv)
                                     true /* 0-copy */, seconds, warmupSeconds};
                     bench.start();
                 }
-                sleep(seconds);
+                sleep(2*seconds);
                 {
                     LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
                             nChunks, chunkSize);
@@ -2252,6 +2252,8 @@ int main(int argc, const char** argv)
         // number of chunks for the deltas instead, and we just included a 16
         // KB base page in each trasmission no matter what.  It's all zero-copy
         // too.
+/*
+	sleep(seconds);
         for (size_t deltaSize : sizes)
         {
             for (size_t nDeltas = 0; nDeltas <= 29; ++nDeltas)
@@ -2260,11 +2262,12 @@ int main(int argc, const char** argv)
                     LOG(INFO, "Running Deltas on #deltas: %lu size: %lu",
                             nDeltas, deltaSize);
                     Benchmark bench{hostNames, 1, 16384, nDeltas, deltaSize,
-                                    true /* 0-copy */, seconds, warmupSeconds};
+                                    true  0-copy , seconds, warmupSeconds};
                     bench.start();
                 }
             }
         }
+*/
     }
 
     return 0;

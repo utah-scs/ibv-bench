@@ -35,17 +35,17 @@ def pdcp(src,dest,force=False,checked=True):
     """ Copies file to remote hosts using pdcp"""
     logger.info("Copying file %s to %s on all hosts" %(src,dest))
     if force:
-        pdsh("rm -rf %s" % src)
+        pdsh("mkdir -p %s" % dest)
     if checked:
-        return subprocess.check_call('pdcp -r -w^./.emulab-hosts %s %s ' % (src,dest),
+        return subprocess.check_call('pdcp -r -w^./.emulab-hosts %s %s > /dev/null' % (src,dest),
                                      shell=True, stdout=sys.stdout)
     else:
-        return subprocess.call('pdcp -r -w^./.emulab-hosts %s %s' %(src,dest),
+        return subprocess.call('pdcp -r -w^./.emulab-hosts %s %s > /dev/null' %(src,dest),
                                shell=True, stdout=sys.stdout)
 
 class BenchmarkRunner(object):
 
-    def __init__(self, server, extra_args, user=None, profile=None, binary="ibv-bench", num_clients=None):
+    def __init__(self, server, extra_args, user=None, profile=None, binary="ibv-bench",debug=False, num_clients=None):
         self.num_clients = num_clients
         self.extra_server_args = '--hugePages'
         self.extra_client_args = extra_args + ' --hugePages'
@@ -62,6 +62,7 @@ class BenchmarkRunner(object):
         self.user = user if user else ""
         self.profile = False if profile is None else True 
         self.binary = binary
+        self.debug = debug
 
     def __enter__(self):
         self.populate_hosts()
@@ -72,11 +73,10 @@ class BenchmarkRunner(object):
             self.node_names = self.node_names[:self.num_clients + 1]
             self.host_names = self.host_names[:self.num_clients + 1]
         self.start_time = datetime.datetime.now()
-	if self.parallel:
+        if self.parallel:
             with open("./.emulab-hosts",'w') as f:
                     for host in self.host_names:
                         f.write(host+'\n')
-
         return self 
 
     def __exit__(self, type, value, traceback):
@@ -99,7 +99,6 @@ class BenchmarkRunner(object):
                 self.node_type = host.get('name')
         
     def get_name(self):
-
         size=self.extra_client_args.split("minChunkSize=",4)[1].split(" ")[0]
         chunks=self.extra_client_args.split("minChunksPerMessage=",4)[1].split(" ")[0]
         return (self.start_time.strftime('%Y%m%d%H%M') +
@@ -107,7 +106,6 @@ class BenchmarkRunner(object):
 
     def collect_results(self):
         assert(self.end_time != None)
-
         log_dir = os.path.join('logs', self.get_name())
         latest = os.path.join('logs', 'latest')
         try:
@@ -132,6 +130,10 @@ class BenchmarkRunner(object):
         subprocess.call("rsync -ave ssh %s:~/ibv-bench/%s*.log %s/" %
                 (self.host_names[0], self.get_name(), log_dir),
                 shell=True, stdout=sys.stdout)
+        subprocess.call("rsync -ave ssh %s:~/ibv-bench/%s*.csv %s/" %
+                (self.host_names[0], self.get_name(), log_dir),
+                shell=True, stdout=sys.stdout)
+
 
         try:
             out = os.path.join('logs', 'latest', 'out')
@@ -152,7 +154,7 @@ class BenchmarkRunner(object):
 
     def send_code_pdcp(self):
         logger.info("Sending code to all servers")
-        pdcp("../ibv-bench", "~/ibv-bench",force=True)
+        pdcp(".", "~/ibv-bench")
         
     def compile_code(self, server, parallel=False):
         if parallel:
@@ -201,11 +203,11 @@ class BenchmarkRunner(object):
 
     def run(self):
         try:
-            if self.parallel:
-                self.send_code_pdcp()
-            else:
-                for host in self.host_names:
-                    self.send_code(host)
+            #if self.parallel:
+            #    self.send_code_pdcp()
+            #else:
+            for host in self.host_names:
+                self.send_code(host)
             some_rebooting = False
             for host in self.host_names:
                 r = self.check_huge_pages(host)
@@ -228,21 +230,19 @@ class BenchmarkRunner(object):
                     self.compile_code(host,self.parallel)
 
             procs = self.start_servers()
-	    time.sleep(5)
-	    if self.profile:
-	        logger.info("running with profiler")
-		ssh(self.host_names[0], 'sudo su -c \'echo -1 > /proc/sys/kernel/perf_event_paranoid\'')
-	        client_cmd = ('(cd ibv-bench; python pmu-tools/ucevent/ucevent.py' +
-                		' -I 100 --socket 0 -o %s-membw.csv -x, --scale MB' % self.get_name() +
-                		' iMC.MEM_BW_TOTAL CBO.LLC_DDIO_MEM_TOTAL_BYTES CBO.LLC_PCIE_MEM_TOTAL_BYTES  -- sh -c \'./%s' % self.binary +
-				' client %s %s 2>&1 > %s-out.log | tee %s-err.log\')'
-				% (' '.join(self.public_names[1:]),
-                		self.extra_client_args,
-               			self.get_name(),
-                		self.get_name()))
-	    else:
-		logger.info("Running without profiler")
-		client_cmd = ('(cd ibv-bench; ' +
+            time.sleep(5)
+            if self.profile:
+                logger.info("running with profiler")
+                ssh(self.host_names[0], 'sudo su -c \'echo -1 > /proc/sys/kernel/perf_event_paranoid\'')
+                profile_cmd = ('(cd ibv-bench;python ~/ibv-bench/pmu-tools/ucevent/ucevent.py' +
+                               ' -I 100 --socket 0 -o %s-membw.csv -x, --scale MB' % self.get_name() +
+                               ' iMC.MEM_BW_TOTAL CBO.LLC_DDIO_MEM_TOTAL_BYTES CBO.LLC_PCIE_MEM_TOTAL_BYTES) ')
+                logger.info("profile cmd:%s" % profile_cmd)
+                subprocess.check_call('ssh -f %s "%s &"' % (self.host_names[0], profile_cmd),
+                                       shell=True, stdout=sys.stdout)
+            else:
+                logger.info("Running without profiler")
+            client_cmd = ('(cd ibv-bench; ' +
                                 './%s client %s %s 2>&1 > %s-out.log | tee %s-err.log)'
                                 % (self.binary, ' '.join(self.public_names[1:]),
                                 self.extra_client_args,
@@ -251,8 +251,16 @@ class BenchmarkRunner(object):
 
             logger.info("Starting client processes; " +
                         "benchmarks will take a few hours.")
+            if self.debug:
+                logger.info("Debug mode. run %s manually on %s or ",client_cmd,self.host_names[0])
+                raw_input("Type Enter to continue:")
             ssh(self.host_names[0], client_cmd)
-
+            if self.profile:
+                time.sleep(10) 
+                try:
+                    ssh(self.host_names[0], 'pkill -f ucevent.py')
+                except subprocess.CalledProcessError:
+                    pass
         finally:
             self.end_time = datetime.datetime.now()
             logger.info("Collecting results ...")
@@ -284,15 +292,17 @@ def main():
                            help="Cloudlab username if different from the " +
                                 "current user")
     optionals.add_argument("--profile", default=None,
-			   help="Profile memory bandwidth using pmu-tools")
+                       help="Profile memory bandwidth using pmu-tools")
     optionals.add_argument("--nosend", default=False,
-			   help="Don't send data")
+               help="Don't send data")
     optionals.add_argument("--chunks", default="all",
-			   help="Number of objects to send")
+               help="Number of objects to send")
     optionals.add_argument("--size", default="both",
-			   help="Object size")
+               help="Object size")
     optionals.add_argument("--seconds", default="30",
-			   help="Time to run each data point")
+               help="Time to run each data point")
+    optionals.add_argument("--debug", default=False,
+                           help="Debug mode. Don't start clients")
 
     args, unknowns = parser.parse_known_args()
 
@@ -303,10 +313,14 @@ def main():
     else:
         server = args.user+"@"+args.hostname[0]
     if not args.nosend:
-	binary = "ibv-bench"
+        binary = "ibv-bench"
     else:
-	binary = "nosend"
+        binary = "nosend"
     num_clients = args.clients
+    if not args.debug:
+        debug=False
+    else:
+        debug=True
     #extra_args = " ".join(unknowns)
     loglevel=getattr(logging, args.log_level.upper(), "INFO")
     logging.basicConfig(level=loglevel)
@@ -315,33 +329,33 @@ def main():
         for i in range(1,33):
             if args.size == "both":
                 extra_args.append(("--minChunkSize=128 --maxChunkSize=128 " 
-                                 "--minChunksPerMessage=%s --maxChunksPerMessage=%s " % (str(i),str(i)) +
-                                 "--seconds=%s" % args.seconds))
+                                  "--minChunksPerMessage=%s --maxChunksPerMessage=%s " % (str(i),str(i)) +
+                                  "--seconds=%s" % args.seconds))
                 extra_args.append(("--minChunkSize=1024 --maxChunkSize=1024 " 
-                                 "--minChunksPerMessage=%s --maxChunksPerMessage=%s " %(str(i),str(i)) +
-                                 "--seconds=%s" % args.seconds))
+                                   "--minChunksPerMessage=%s --maxChunksPerMessage=%s " %(str(i),str(i)) +
+                                   "--seconds=%s" % args.seconds))
             else:
                 extra_args.append(("--minChunkSize=%s --maxChunkSize=%s " %(args.size, args.size) + 
-                                 "--minChunksPerMessage=%s --maxChunksPerMessage=%s " %(str(i), str(i)) +
-                                 "--seconds=%s" % args.seconds))
+                                   "--minChunksPerMessage=%s --maxChunksPerMessage=%s " %(str(i), str(i)) +
+                                   "--seconds=%s" % args.seconds))
     else:
         if args.size == "both":
             extra_args.append(("--minChunkSize=128 --maxChunkSize=128 " 
-                             "--minChunksPerMessage=%s --maxChunksPerMessage=%s " %(args.chunks,args.chunks) +
-                             "--seconds=%s" % args.seconds))
+                               "--minChunksPerMessage=%s --maxChunksPerMessage=%s " %(args.chunks,args.chunks) +
+                               "--seconds=%s" % args.seconds))
             extra_args.append(("--minChunkSize=1024 --maxChunkSize=1024 " 
-                             "--minChunksPerMessage=%s --maxChunksPerMessage=%s " %(args.chunks, args.chunks) +
-                             "--seconds=%s" % args.seconds))
+                               "--minChunksPerMessage=%s --maxChunksPerMessage=%s " %(args.chunks, args.chunks) +
+                               "--seconds=%s" % args.seconds))
         else:
             extra_args.append(("--minChunkSize=%s --maxChunkSize=%s " %(args.size, args.size) +
-                             "--minChunksPerMessage=%s --maxChunksPerMessage=%s " %(args.chunks, args.chunks) +
-                             "--seconds=%s" % args.seconds))
+                               "--minChunksPerMessage=%s --maxChunksPerMessage=%s " %(args.chunks, args.chunks) +
+                               "--seconds=%s" % args.seconds))
 
 
     
     for extra_arg in extra_args:
         logger.info("Running with %s" % extra_arg)
-        with BenchmarkRunner(server, extra_arg, args.user, args.profile, binary, num_clients=num_clients) as br:
+        with BenchmarkRunner(server, extra_arg, args.user, args.profile, binary, debug=debug, num_clients=num_clients) as br:
             logger.info('Found hosts %s' % ' '.join(br.host_names))
             cmd = args.cmd
             if cmd == 'run':
