@@ -31,6 +31,17 @@ def pdsh(cmd, checked=True):
         return subprocess.call('pdsh -w^./.emulab-hosts "%s"' %cmd,
                                shell=True, stdout=sys.stdout)
 
+def pdcp(src,dest,force=False,checked=True):
+    """ Copies file to remote hosts using pdcp"""
+    logger.info("Copying file %s to %s on all hosts" %(src,dest))
+    if force:
+        pdsh("rm -rf %s" % src)
+    if checked:
+        return subprocess.check_call('pdcp -r -w^./.emulab-hosts %s %s ' % (src,dest),
+                                     shell=True, stdout=sys.stdout)
+    else:
+        return subprocess.call('pdcp -r -w^./.emulab-hosts %s %s' %(src,dest),
+                               shell=True, stdout=sys.stdout)
 
 class BenchmarkRunner(object):
 
@@ -45,9 +56,9 @@ class BenchmarkRunner(object):
         self.public_names = []
         self.start_time = None
         self.end_time = None
-        self.parallel = self.cmd_exists("pdsh")
+        self.parallel = self.cmd_exists("pdsh") and self.cmd_exists("pdcp")
         if not self.parallel:
-            logger.warn("Remote commands could be faster if you install and configure pdsh")
+            logger.warn("Remote commands could be faster if you install and configure pdsh and pdcp")
         self.user = user if user else ""
         self.profile = False if profile is None else True 
         self.binary = binary
@@ -64,7 +75,7 @@ class BenchmarkRunner(object):
 	if self.parallel:
             with open("./.emulab-hosts",'w') as f:
                     for host in self.host_names:
-                        f.write(host[0]+'\n')
+                        f.write(host+'\n')
 
         return self 
 
@@ -139,6 +150,10 @@ class BenchmarkRunner(object):
                               "./ %s:~/ibv-bench/ > /dev/null" % server,
                               shell=True, stdout=sys.stdout)
 
+    def send_code_pdcp(self):
+        logger.info("Sending code to all servers")
+        pdcp("../ibv-bench", "~/ibv-bench",force=True)
+        
     def compile_code(self, server, parallel=False):
         if parallel:
             logger.info("Compiling code parallely")
@@ -186,8 +201,11 @@ class BenchmarkRunner(object):
 
     def run(self):
         try:
-            for host in self.host_names:
-                self.send_code(host)
+            if self.parallel:
+                self.send_code_pdcp()
+            else:
+                for host in self.host_names:
+                    self.send_code(host)
             some_rebooting = False
             for host in self.host_names:
                 r = self.check_huge_pages(host)
@@ -294,7 +312,7 @@ def main():
     logging.basicConfig(level=loglevel)
     extra_args = []
     if args.chunks == "all":
-        for i in range(1,32):
+        for i in range(1,33):
             if args.size == "both":
                 extra_args.append(("--minChunkSize=128 --maxChunkSize=128 " 
                                  "--minChunksPerMessage=%s --maxChunksPerMessage=%s " % (str(i),str(i)) +

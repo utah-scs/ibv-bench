@@ -3,5 +3,9 @@ browse.*
 .gitignore
 *.o
 ibv-bench
+nosend
+.RData
+.Rhistory
+.emulab-hosts
 *.pyc
 logs/
