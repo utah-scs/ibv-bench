@@ -2011,7 +2011,7 @@ class Benchmark {
         while (!go);
 
         // warmup
-        run(threadState, warmupSeconds, threadNum);
+        //run(threadState, warmupSeconds, threadNum);
 
         threadMetrics.reset();
 
