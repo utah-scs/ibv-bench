@@ -2011,7 +2011,7 @@ class Benchmark {
         while (!go);
 
         // warmup
-        //run(threadState, warmupSeconds, threadNum);
+        run(threadState, warmupSeconds, threadNum);
 
         threadMetrics.reset();
 
@@ -2130,13 +2130,15 @@ static const char USAGE[] =
 R"(ibv-bench.
 
     Usage:
-      ibv-bench server <hostname> [--hugePages]
-      ibv-bench client <hostname>... [--hugePages] [--minChunkSize=SIZE] [--maxChunkSize=SIZE] [--minChunksPerMessage=CHUNKS] [--maxChunksPerMessage=CHUNKS] [--seconds=SECONDS] [--warmup=SECONDS]
+      ibv-bench server <hostname> [--hugePages] [--runZeroCopyOnly] [--runCopyOutOnly]
+      ibv-bench client <hostname>... [--hugePages] [--runZeroCopyOnly] [--runCopyOutOnly] [--minChunkSize=SIZE] [--maxChunkSize=SIZE] [--minChunksPerMessage=CHUNKS] [--maxChunksPerMessage=CHUNKS] [--seconds=SECONDS] [--warmup=SECONDS]
       ibv-bench (-h | --help)
 
     Options:
       -h --help                     Show this screen
       --hugePages                   Use huge pages
+      --runZeroCopyOnly             Don't run Copy Out mode
+      --runCopyOutOnly              Don't run Zero Copy mode
       --minChunkSize=SIZE           Smallest size of individual objects [default: 1]
       --maxChunkSize=SIZE           Smallest size of individual objects [default: 1024]
       --minChunksPerMessage=CHUNKS  Min Number of objects to send per send [default: 1]
@@ -2162,6 +2164,16 @@ int main(int argc, const char** argv)
     const bool isServer = bool(args["server"]) && args["server"].asBool();
     const bool useHugePages = bool(args["--hugePages"]) &&
                               args["--hugePages"].asBool();
+    bool onlyZeroCopy =  false;
+    onlyZeroCopy = (args["--runZeroCopyOnly"]) &&
+                    args["--runZeroCopyOnly"].asBool();
+    bool onlyCopyOut = false;
+    onlyCopyOut =  (args["--runCopyOutOnly"]) &&
+                    args["--runCopyOutOnly"].asBool();
+    if (onlyZeroCopy && onlyCopyOut){
+        LOG(ERROR, "Can't use both --runZeroCopyOnly and --runCopyOutOnly");
+        exit(1);
+    }
     const size_t minChunkSize = args["--minChunkSize"].asLong();
     const size_t maxChunkSize = args["--maxChunkSize"].asLong();
     const size_t minChunksPerMessage = args["--minChunksPerMessage"].asLong();
@@ -2221,7 +2233,8 @@ int main(int argc, const char** argv)
             for (size_t nChunks = minChunksPerMessage;
                  nChunks <= maxChunksPerMessage && nChunks <= 32;
                  ++nChunks)
-            {
+            {  
+                if(!onlyCopyOut) 
                 {
                     LOG(INFO, "Running Zero Copy on #chunks: %lu size: %lu",
                             nChunks, chunkSize);
@@ -2229,7 +2242,7 @@ int main(int argc, const char** argv)
                                     true /* 0-copy */, seconds, warmupSeconds};
                     bench.start();
                 }
-                sleep(2*seconds);
+                if(!onlyZeroCopy)
                 {
                     LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
                             nChunks, chunkSize);
