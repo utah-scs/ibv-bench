@@ -101,8 +101,12 @@ class BenchmarkRunner(object):
     def get_name(self):
         size=self.extra_client_args.split("minChunkSize=",4)[1].split(" ")[0]
         chunks=self.extra_client_args.split("minChunksPerMessage=",4)[1].split(" ")[0]
+        try:
+            mode=self.extra_client_args.split("--run",4)[1].split(" ")[0]
+        except IndexError:
+            mode="all"
         return (self.start_time.strftime('%Y%m%d%H%M') +
-                '-%d-clients-%sB-%schunks-%s' % (len(self.node_names) - 1, size, chunks, self.node_type))
+                '-%s-%sB-%schunks-%s' % (mode, size, chunks, self.node_type))
 
     def collect_results(self):
         assert(self.end_time != None)
@@ -303,6 +307,10 @@ def main():
                help="Time to run each data point")
     optionals.add_argument("--debug", default=False,
                            help="Debug mode. Don't start clients")
+    optionals.add_argument("--nozerocopy", default=False,
+                           help="Don't run Zero Copy")
+    optionals.add_argument("--nocopyout", default=False,
+                           help="Don't run Copy Out")
 
     args, unknowns = parser.parse_known_args()
 
@@ -325,31 +333,36 @@ def main():
     loglevel=getattr(logging, args.log_level.upper(), "INFO")
     logging.basicConfig(level=loglevel)
     extra_args = []
+    restrict = ""
+    if args.nozerocopy:
+        restrict += " --runCopyOutOnly"
+    if args.nocopyout:
+        restrict += " --runZeroCopyOnly"
     if args.chunks == "all":
         for i in range(1,33):
             if args.size == "both":
                 extra_args.append(("--minChunkSize=128 --maxChunkSize=128 " 
                                   "--minChunksPerMessage=%s --maxChunksPerMessage=%s " % (str(i),str(i)) +
-                                  "--seconds=%s" % args.seconds))
+                                  "--seconds=%s %s" %(args.seconds, restrict)))
                 extra_args.append(("--minChunkSize=1024 --maxChunkSize=1024 " 
                                    "--minChunksPerMessage=%s --maxChunksPerMessage=%s " %(str(i),str(i)) +
-                                   "--seconds=%s" % args.seconds))
+                                   "--seconds=%s %s" %(args.seconds, restrict)))
             else:
                 extra_args.append(("--minChunkSize=%s --maxChunkSize=%s " %(args.size, args.size) + 
                                    "--minChunksPerMessage=%s --maxChunksPerMessage=%s " %(str(i), str(i)) +
-                                   "--seconds=%s" % args.seconds))
+                                   "--seconds=%s %s" %(args.seconds, restrict)))
     else:
         if args.size == "both":
             extra_args.append(("--minChunkSize=128 --maxChunkSize=128 " 
                                "--minChunksPerMessage=%s --maxChunksPerMessage=%s " %(args.chunks,args.chunks) +
-                               "--seconds=%s" % args.seconds))
+                               "--seconds=%s %s" %(args.seconds, restrict)))
             extra_args.append(("--minChunkSize=1024 --maxChunkSize=1024 " 
                                "--minChunksPerMessage=%s --maxChunksPerMessage=%s " %(args.chunks, args.chunks) +
-                               "--seconds=%s" % args.seconds))
+                               "--seconds=%s %s" %(args.seconds, restrict)))
         else:
             extra_args.append(("--minChunkSize=%s --maxChunkSize=%s " %(args.size, args.size) +
                                "--minChunksPerMessage=%s --maxChunksPerMessage=%s " %(args.chunks, args.chunks) +
-                               "--seconds=%s" % args.seconds))
+                               "--seconds=%s %s" %(args.seconds, restrict)))
 
 
     
