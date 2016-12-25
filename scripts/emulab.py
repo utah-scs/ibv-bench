@@ -9,11 +9,16 @@ import datetime
 import logging
 import argparse
 import pprint
+import signal
+
 
 logger=logging.getLogger("BenchmarkRunner")
 
 
-def ssh(server, cmd, checked=True):
+def ssh(server, cmd, checked=True, terminate=False):
+    if terminate:
+        server= '-t ' + server
+        logger.info("cmd: ssh %s \"%s\"" % (server, cmd));
     if checked:
         return subprocess.check_call('ssh %s "%s"' % (server, cmd),
                                      shell=True, stdout=sys.stdout)
@@ -45,7 +50,7 @@ def pdcp(src,dest,force=False,checked=True):
 
 class BenchmarkRunner(object):
 
-    def __init__(self, server, extra_args, user=None, profile=None, binary="ibv-bench",debug=False, num_clients=None):
+    def __init__(self, server, extra_args, user=None, profile=None, binary="ibv-bench", profileinterval="1000", debug=False, num_clients=None):
         self.num_clients = num_clients
         self.extra_server_args = '--hugePages'
         self.extra_client_args = extra_args + ' --hugePages'
@@ -61,6 +66,12 @@ class BenchmarkRunner(object):
             logger.warn("Remote commands could be faster if you install and configure pdsh and pdcp")
         self.user = user if user else ""
         self.profile = False if profile is None else True 
+        if self.profile:
+            self.profileinterval = profileinterval
+            if profile == "true":
+                self.profile_cmd = "membw"
+            else:
+                self.profile_cmd = profile
         self.binary = binary
         self.debug = debug
 
@@ -105,8 +116,12 @@ class BenchmarkRunner(object):
             mode=self.extra_client_args.split("--run",4)[1].split(" ")[0]
         except IndexError:
             mode="all"
+        if self.profile:
+            profile=self.profile_cmd
+        else:
+            profile="noprofile"
         return (self.start_time.strftime('%Y%m%d%H%M') +
-                '-%s-%sB-%schunks-%s' % (mode, size, chunks, self.node_type))
+                '-%s-%sB-%schunks-%s-%s' % (mode, size, chunks, self.node_type, profile))
 
     def collect_results(self):
         assert(self.end_time != None)
@@ -178,8 +193,21 @@ class BenchmarkRunner(object):
         return procs
 
     def killall(self):
+        #getpid_cmd = 'ssh %s "ps axf | grep python | grep ucevent |grep -v bash|grep -v ssh| cut -d \'?\' -f1"' % self.host_names[0] 
+        #pid=subprocess.check_output(getpid_cmd,shell=True)
+        #pid = " ".join(pid.strip().split("\n"))
+        #logger.info("pid command:%s" % getpid_cmd);
+        #logger.info("ucevent pid:%s" % pid);
+        #killpythoncmd='ssh -t %s "kill -2 %s"' %(self.host_names[0],pid)
+        #logger.info("kill cmd:%s" % killpythoncmd)
+        #subprocess.check_output('ssh -t %s "kill -9 %s"' %(self.host_names[0],pid),shell=True)
+        #try:
+        #    subprocess.check_output('ssh -t %s "pkill -f ucevent"' % self.host_names[0], shell=True)
+        #except subprocess.CalledProcessError:
+        #    pass
+        #ssh(self.host_names[0], 'pkill -f ucevent.py',checked=False)
         for host in self.host_names:
-            logger.debug("Killing processes on %s",host)
+            logger.info("Killing processes on %s",host)
             ssh(host, 'pkill -9 %s' % self.binary, checked=False)
 
     def update_limits(self, server):
@@ -232,17 +260,24 @@ class BenchmarkRunner(object):
             else:
                 for host in self.host_names:
                     self.compile_code(host,self.parallel)
-
+            logger.info("Starting servers")
             procs = self.start_servers()
             time.sleep(5)
             if self.profile:
+                if self.profile_cmd == "ddiobw":
+                    profile_flag = "CBO.LLC_DDIO_MEM_TOTAL_BYTES"
+                elif self.profile_cmd == "pciebw":
+                    profile_flag = "CBO.LLC_PCIE_MEM_TOTAL_BYTES"
+                else:
+                    profile_flag = "iMC.MEM_BW_TOTAL"
                 logger.info("running with profiler")
                 ssh(self.host_names[0], 'sudo su -c \'echo -1 > /proc/sys/kernel/perf_event_paranoid\'')
                 profile_cmd = ('(cd ibv-bench;python ~/ibv-bench/pmu-tools/ucevent/ucevent.py' +
-                               ' -I 1000 --socket 0 -o %s-membw.csv -x, --scale MB' % self.get_name() +
-                               ' iMC.MEM_BW_TOTAL) ')
+                               ' -I %s --socket 0 -o %s.csv -x, --scale MB' % (self.profileinterval, self.get_name()) +
+                               ' %s) ' % profile_flag)
                 #               ' iMC.MEM_BW_TOTAL CBO.LLC_DDIO_MEM_TOTAL_BYTES CBO.LLC_PCIE_MEM_TOTAL_BYTES) ')
                 logger.info("profile cmd:%s" % profile_cmd)
+                #profiler_proc = subprocess.Popen(['ssh', self.host_names[0], profile_cmd])
                 subprocess.check_call('ssh -f %s "%s &"' % (self.host_names[0], profile_cmd),
                                        shell=True, stdout=sys.stdout)
             else:
@@ -260,12 +295,11 @@ class BenchmarkRunner(object):
                 logger.info("Debug mode. run %s manually on %s or ",client_cmd,self.host_names[0])
                 raw_input("Type Enter to continue:")
             ssh(self.host_names[0], client_cmd)
-            if self.profile:
-                time.sleep(10) 
-                try:
-                    ssh(self.host_names[0], 'pkill -f ucevent.py')
-                except subprocess.CalledProcessError:
-                    pass
+            #if self.profile:
+            #    try:
+            #        profiler_proc.send_signal(signal.CTRL_C_EVENT)
+            #    except subprocess.CalledProcessError:
+            #        pass
         finally:
             self.end_time = datetime.datetime.now()
             logger.info("Collecting results ...")
@@ -297,14 +331,14 @@ def main():
                            help="Cloudlab username if different from the " +
                                 "current user")
     optionals.add_argument("--profile", default=None,
-                       help="Profile memory bandwidth using pmu-tools")
+                       help="Profile memory bandwidth using pmu-tools(membw,ddiobw,pciebw)")
     optionals.add_argument("--nosend", default=False,
                help="Don't send data")
     optionals.add_argument("--chunks", default="all",
                help="Number of objects to send")
     optionals.add_argument("--size", default="both",
                help="Object size")
-    optionals.add_argument("--seconds", default="30",
+    optionals.add_argument("--seconds", default="60",
                help="Time to run each data point")
     optionals.add_argument("--debug", default=False,
                            help="Debug mode. Don't start clients")
@@ -312,6 +346,8 @@ def main():
                            help="Don't run Zero Copy")
     optionals.add_argument("--nocopyout", default=False,
                            help="Don't run Copy Out")
+    optionals.add_argument("--profileinterval", default="1000",
+                           help="profile interval in ms")
 
     args, unknowns = parser.parse_known_args()
 
@@ -369,7 +405,7 @@ def main():
     
     for extra_arg in extra_args:
         logger.info("Running with %s" % extra_arg)
-        with BenchmarkRunner(server, extra_arg, args.user, args.profile, binary, debug=debug, num_clients=num_clients) as br:
+        with BenchmarkRunner(server, extra_arg, args.user, args.profile, binary, args.profileinterval, debug=debug, num_clients=num_clients) as br:
             logger.info('Found hosts %s' % ' '.join(br.host_names))
             cmd = args.cmd
             if cmd == 'run':

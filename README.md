@@ -80,3 +80,29 @@ python scripts/emulab.py nameofnode-0.apt.emulab.net
      finish
   * When it finishes, it will copy all results to the `logs/` subdirectory of
     the repository on your local machine
+
+## Steps for running the benchmark while profiling Memory, DDIO and PCIe traffic
+
+1. We use [pmu-tools](https://github.com/andikleen/pmu-tools) repository 
+   courtesy of [Andi Kleen](https://github.com/andikleen) to measure uncore events via perf.
+2. It's always best to run single data points (fixed chunk size, number of chunks and mode of copy)
+   for one of the available profiles to measure DDIO Bandwidth, Memory Bandwidth and PCIE bandwidth
+3. Running independent experiments over all chunks for 128B and 1024B objects takes around 12 hours.
+4. You can run the following in bash (on one of the nodes) to run all data points:
+   ```
+   for c in {1..32}
+   do
+     for s in {128,1024}
+     do
+       for m in {ddiobw,pciebw,membw}
+       do 
+         python scripts/emulab.py `hostname` --profile=$m --nocopyout true --seconds=60 --chunks=$c --size=$s > /dev/null 2>&1
+         ps axf | grep python | grep ucevent |grep -v bash|grep -v ssh| awk '{print "kill -2 " $1}'|sh
+         ps axf | grep python | grep ucevent |grep -v bash|awk '{print "kill -2 " $1}'|sh
+         python scripts/emulab.py `hostname` --profile=$m --nozerocopy true --seconds=60 --chunks=$c --size=$s > /dev/null 2>&1
+         ps axf | grep python | grep ucevent |grep -v bash|grep -v ssh| awk '{print "kill -2 " $1}'|sh
+         ps axf | grep python | grep ucevent |grep -v bash|awk '{print "kill -2 " $1}'|sh
+       done
+     done
+   done
+   ```
