@@ -87,8 +87,9 @@ python scripts/emulab.py nameofnode-0.apt.emulab.net
    courtesy of [Andi Kleen](https://github.com/andikleen) to measure uncore events via perf.
 2. It's always best to run single data points (fixed chunk size, number of chunks and mode of copy)
    for one of the available profiles to measure DDIO Bandwidth, Memory Bandwidth and PCIE bandwidth
-3. Running independent experiments over all chunks for 128B and 1024B objects takes around 12 hours.
-4. You can run the following in bash (on one of the nodes) to run all data points:
+3. Running independent experiments over all chunks for 128B and 1024B objects and the delta experiments takes around 15 hours.
+4. You can run the following in bash (on node-0/client-0 in the experiment) to run all data points. To repeat results from 
+   Aniraj's thesis, run on r320 nodes on APT with 15 clients:
    ```
    for c in {1..32}
    do
@@ -100,6 +101,9 @@ python scripts/emulab.py nameofnode-0.apt.emulab.net
          ps axf | grep python | grep ucevent |grep -v bash|grep -v ssh| awk '{print "kill -2 " $1}'|sh
          ps axf | grep python | grep ucevent |grep -v bash|awk '{print "kill -2 " $1}'|sh
          python scripts/emulab.py `hostname` --profile=$m --nozerocopy true --seconds=60 --chunks=$c --size=$s > /dev/null 2>&1
+         ps axf | grep python | grep ucevent |grep -v bash|grep -v ssh| awk '{print "kill -2 " $1}'|sh
+         ps axf | grep python | grep ucevent |grep -v bash|awk '{print "kill -2 " $1}'|sh
+         python scripts/emulab.py `hostname` --profile=$m --onlydeltas true --seconds=60 --chunks=$c --size=$s > /dev/null 2>&1
          ps axf | grep python | grep ucevent |grep -v bash|grep -v ssh| awk '{print "kill -2 " $1}'|sh
          ps axf | grep python | grep ucevent |grep -v bash|awk '{print "kill -2 " $1}'|sh
        done

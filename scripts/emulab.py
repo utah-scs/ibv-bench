@@ -77,6 +77,19 @@ class BenchmarkRunner(object):
 
     def __enter__(self):
         self.populate_hosts()
+	# Only use r320s in a mixed cluster
+	if any("client" in host for host in self.host_names):
+	    newhostnames = []
+	    newnodenames = []
+	    newpublicnames = []
+	    for index,host in enumerate(self.host_names):
+	        if "client" in host:
+		    newhostnames.append(host)
+		    newnodenames.append(self.node_names[index])
+		    newpublicnames.append(self.public_names[index])
+	    self.host_names = newhostnames
+	    self.node_names = newnodenames
+	    self.public_names = newpublicnames
         if self.num_clients is not None:
             if self.num_clients >= len(self.node_names):
                 logger.error("Not enough machines, use less number of clients")
@@ -282,9 +295,13 @@ class BenchmarkRunner(object):
                                        shell=True, stdout=sys.stdout)
             else:
                 logger.info("Running without profiler")
+	    if self.num_clients is None:
+	        client_list = ' '.join(self.public_names[1:])
+	    else:
+		client_list = ' '.join(self.public_names[1:self.num_clients+1])
             client_cmd = ('(cd ibv-bench; ' +
                                 './%s client %s %s 2>&1 > %s-out.log | tee %s-err.log)'
-                                % (self.binary, ' '.join(self.public_names[1:]),
+                                % (self.binary, client_list,
                                 self.extra_client_args,
                                 self.get_name(),
                                 self.get_name()))
@@ -346,6 +363,8 @@ def main():
                            help="Don't run Zero Copy")
     optionals.add_argument("--nocopyout", default=False,
                            help="Don't run Copy Out")
+    optionals.add_argument("--onlydeltas", default=False,
+			   help="Only run Delta experiments")
     optionals.add_argument("--profileinterval", default="1000",
                            help="profile interval in ms")
 
@@ -375,6 +394,8 @@ def main():
         restrict += " --runCopyOutOnly"
     if args.nocopyout:
         restrict += " --runZeroCopyOnly"
+    if args.onlydeltas:
+	restrict +=" --runDeltasOnly"
     if args.chunks == "all":
         for i in range(1,33):
             if args.size == "both":

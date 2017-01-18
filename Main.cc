@@ -2130,8 +2130,8 @@ static const char USAGE[] =
 R"(ibv-bench.
 
     Usage:
-      ibv-bench server <hostname> [--hugePages] [--runZeroCopyOnly] [--runCopyOutOnly]
-      ibv-bench client <hostname>... [--hugePages] [--runZeroCopyOnly] [--runCopyOutOnly] [--minChunkSize=SIZE] [--maxChunkSize=SIZE] [--minChunksPerMessage=CHUNKS] [--maxChunksPerMessage=CHUNKS] [--seconds=SECONDS] [--warmup=SECONDS]
+      ibv-bench server <hostname> [--hugePages] [--runZeroCopyOnly] [--runCopyOutOnly] [--runDeltasOnly]
+      ibv-bench client <hostname>... [--hugePages] [--runZeroCopyOnly] [--runCopyOutOnly] [--runDeltasOnly] [--minChunkSize=SIZE] [--maxChunkSize=SIZE] [--minChunksPerMessage=CHUNKS] [--maxChunksPerMessage=CHUNKS] [--seconds=SECONDS] [--warmup=SECONDS]
       ibv-bench (-h | --help)
 
     Options:
@@ -2139,6 +2139,7 @@ R"(ibv-bench.
       --hugePages                   Use huge pages
       --runZeroCopyOnly             Don't run Copy Out mode
       --runCopyOutOnly              Don't run Zero Copy mode
+      --runDeltasOnly               Only Run Delta Experiments
       --minChunkSize=SIZE           Smallest size of individual objects [default: 1]
       --maxChunkSize=SIZE           Smallest size of individual objects [default: 1024]
       --minChunksPerMessage=CHUNKS  Min Number of objects to send per send [default: 1]
@@ -2170,6 +2171,12 @@ int main(int argc, const char** argv)
     bool onlyCopyOut = false;
     onlyCopyOut =  (args["--runCopyOutOnly"]) &&
                     args["--runCopyOutOnly"].asBool();
+    bool onlyDeltas = false;
+    onlyDeltas = (args["--runDeltasOnly"]) &&
+		  args["--runDeltasOnly"].asBool();
+    if (onlyDeltas && (onlyZeroCopy || onlyCopyOut)){
+	LOG(ERROR, "When using --runDeltasOnly, can't use other restrictive modes");
+    }
     if (onlyZeroCopy && onlyCopyOut){
         LOG(ERROR, "Can't use both --runZeroCopyOnly and --runCopyOutOnly");
         exit(1);
@@ -2223,66 +2230,67 @@ int main(int argc, const char** argv)
         LOG(INFO, "Running client benchmarks");
 
         ThreadMetrics::dumpHeader();
-
-        for (size_t chunkSize = minChunkSize;
-            chunkSize <= maxChunkSize;
-            chunkSize *= 2)
-        // const std::vector<size_t> sizes{128, 1024};
-        // for (size_t chunkSize : sizes)
+        if(!onlyDeltas)
         {
-            for (size_t nChunks = minChunksPerMessage;
-                 nChunks <= maxChunksPerMessage && nChunks <= 32;
-                 ++nChunks)
-            {  
-                if(!onlyCopyOut) 
+                for (size_t chunkSize = minChunkSize;
+                    chunkSize <= maxChunkSize;
+                    chunkSize *= 2)
+                // const std::vector<size_t> sizes{128, 1024};
+                // for (size_t chunkSize : sizes)
                 {
-                    LOG(INFO, "Running Zero Copy on #chunks: %lu size: %lu",
-                            nChunks, chunkSize);
-                    Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
-                                    true /* 0-copy */, seconds, warmupSeconds};
-                    bench.start();
+                    for (size_t nChunks = minChunksPerMessage;
+                         nChunks <= maxChunksPerMessage && nChunks <= 32;
+                         ++nChunks)
+                    {  
+                        if(!onlyCopyOut) 
+                        {
+                            LOG(INFO, "Running Zero Copy on #chunks: %lu size: %lu",
+                                    nChunks, chunkSize);
+                            Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
+                                            true /* 0-copy */, seconds, warmupSeconds};
+                            bench.start();
+                        }
+                        if(!onlyZeroCopy)
+                        {
+                            LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
+                                    nChunks, chunkSize);
+                            Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
+                                            false /* no 0-copy */, seconds, warmupSeconds};
+                            bench.start();
+                        }
+                    }
+                    // Power of 2 number of chunks
+                    // for (size_t nChunks = 64; nChunks <= maxChunksPerMessage; nChunks *=2) {
+                    //     LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
+                    //             nChunks, chunkSize);
+                    //     Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
+                    //                     false /* doZeroCopy */, seconds, warmupSeconds};
+                    //     bench.start();
+                    // }
                 }
-                if(!onlyZeroCopy)
-                {
-                    LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
-                            nChunks, chunkSize);
-                    Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
-                                    false /* no 0-copy */, seconds, warmupSeconds};
-                    bench.start();
-                }
-            }
-            // Power of 2 number of chunks
-            // for (size_t nChunks = 64; nChunks <= maxChunksPerMessage; nChunks *=2) {
-            //     LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
-            //             nChunks, chunkSize);
-            //     Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
-            //                     false /* doZeroCopy */, seconds, warmupSeconds};
-            //     bench.start();
-            // }
-        }
+        } else {
 
         // Delta record tests. For these we use the command line args for
         // number of chunks for the deltas instead, and we just included a 16
         // KB base page in each trasmission no matter what.  It's all zero-copy
         // too.
-/*
-	sleep(seconds);
-        for (size_t deltaSize : sizes)
-        {
-            for (size_t nDeltas = 0; nDeltas <= 29; ++nDeltas)
-            {
+        for (size_t deltaSize = minChunkSize;
+            deltaSize <= maxChunkSize;
+            deltaSize *= 2)
                 {
-                    LOG(INFO, "Running Deltas on #deltas: %lu size: %lu",
-                            nDeltas, deltaSize);
-                    Benchmark bench{hostNames, 1, 16384, nDeltas, deltaSize,
-                                    true  0-copy , seconds, warmupSeconds};
-                    bench.start();
+                    for (size_t nDeltas = minChunksPerMessage - 1; nDeltas <= (maxChunksPerMessage - 1); ++nDeltas)
+                    {
+                        {
+                            LOG(INFO, "Running Deltas on #deltas: %lu size: %lu",
+                                    nDeltas, deltaSize);
+                            Benchmark bench{hostNames, 1, 16384, nDeltas, deltaSize,
+                                            true/*always  0-copy*/ , seconds, warmupSeconds};
+                            bench.start();
+                        }
+                    }
                 }
-            }
-        }
-*/
     }
-
+    }
     return 0;
 }
 
