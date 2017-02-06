@@ -25,7 +25,15 @@ rdtsc()
     return (((uint64_t)hi << 32) | lo);
 }
 
-uint32_t generateRandom();
+class PRNG {
+ public:
+  explicit PRNG(size_t threadId);
+  uint32_t generate();
+  void dump();
+
+  uint32_t x, y, z, w;
+};
+
 std::vector<std::string> split(std::string str, char delimiter);
 
 

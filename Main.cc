@@ -1879,15 +1879,17 @@ class Benchmark {
         threadState->chunks.resize(nDeltas + nChunks);
         uint32_t start = 0;
 
+        PRNG prng{threadNum};
+
         for (size_t i = 0; i < nDeltas; ++i) {
-            start = generateRandom();
+            start = prng.generate();
             start = start % (logSize - deltaSize);
             threadState->chunks[i].p = (void*)(logMemoryBase + start);
             threadState->chunks[i].len = deltaSize;
         }
 
         for (size_t i = 0; i < nChunks; ++i) {
-            start = generateRandom();
+            start = prng.generate();
             start = start % (logSize - chunkSize);
             threadState->chunks[i].p = (void*)(logMemoryBase + start);
             threadState->chunks[i].len = chunkSize;
