@@ -241,7 +241,9 @@ class ZipfianGenerator {
      */
     uint64_t nextNumber()
     {
-        double u = static_cast<double>(generateRandom()) /
+	
+	PRNG prng{1};
+        double u = static_cast<double>(prng.generate()) /
                    static_cast<double>(~0UL);
         double uz = u * zetan;
         if (uz < 1)
@@ -1962,7 +1964,7 @@ class Benchmark {
                 nDeltas, deltaSize);
 
         pinTo(threadNum);
-
+	PRNG prng{threadNum};
         threadState->chunks.resize(nDeltas + nChunks);
         uint32_t start = 0;
 
@@ -1974,7 +1976,7 @@ class Benchmark {
         ramCloudHashTable.rehash(logSize/chunkSize);
 
         for (size_t i = 0; i < nDeltas; ++i) {
-            start = generateRandom();
+            start = prng.generate();
             start = start % (logSize - deltaSize);
             threadState->chunks[i].p = (void*)(logMemoryBase + start);
             threadState->chunks[i].len = deltaSize;
@@ -1986,7 +1988,7 @@ class Benchmark {
         }
 
         for (size_t i = 0; i < nChunks; ++i) {
-            start = generateRandom();
+            start = prng.generate();
             start = start % (logSize - chunkSize);
             threadState->chunks[i].p = (void*)(logMemoryBase + start);
             threadState->chunks[i].len = chunkSize;
@@ -2067,18 +2069,18 @@ class Benchmark {
 
         bool refreshChunks = true;
         uint32_t start = 0;
-
+	PRNG prng{threadNum};
         while (true) {
             if (refreshChunks == true) {
                 for (size_t i = 0; i < nDeltas; ++i) {
-                    start = generateRandom();
+                    start = prng.generate();
                     start = start % (logSize - deltaSize);
                     threadState->chunks[i].p = (void*)(logMemoryBase + start);
                     threadState->chunks[i].len = deltaSize;
                 }
 
                 for (size_t i = 0; i < nChunks; ++i) {
-                    start = generateRandom();
+                    start = prng.generate();
                     start = start % (logSize - chunkSize);
                     threadState->chunks[i].p = (void*)(logMemoryBase + start);
                     threadState->chunks[i].len = chunkSize;
