@@ -91,22 +91,5 @@ python scripts/emulab.py nameofnode-0.apt.emulab.net
 4. You can run the following in bash (on node-0/client-0 in the experiment) to run all data points. To repeat results from 
    Aniraj's thesis, run on r320 nodes on APT with 15 clients:
    ```
-   for c in {1..32}
-   do
-     for s in {128,1024}
-     do
-       for m in {ddiobw,pciebw,membw}
-       do 
-         python scripts/emulab.py `hostname` --profile=$m --nocopyout true --seconds=60 --chunks=$c --size=$s > /dev/null 2>&1
-         ps axf | grep python | grep ucevent |grep -v bash|grep -v ssh| awk '{print "kill -2 " $1}'|sh
-         ps axf | grep python | grep ucevent |grep -v bash|awk '{print "kill -2 " $1}'|sh
-         python scripts/emulab.py `hostname` --profile=$m --nozerocopy true --seconds=60 --chunks=$c --size=$s > /dev/null 2>&1
-         ps axf | grep python | grep ucevent |grep -v bash|grep -v ssh| awk '{print "kill -2 " $1}'|sh
-         ps axf | grep python | grep ucevent |grep -v bash|awk '{print "kill -2 " $1}'|sh
-         python scripts/emulab.py `hostname` --profile=$m --onlydeltas true --seconds=60 --chunks=$c --size=$s > /dev/null 2>&1
-         ps axf | grep python | grep ucevent |grep -v bash|grep -v ssh| awk '{print "kill -2 " $1}'|sh
-         ps axf | grep python | grep ucevent |grep -v bash|awk '{print "kill -2 " $1}'|sh
-       done
-     done
-   done
+   bash run-all.sh
    ```
