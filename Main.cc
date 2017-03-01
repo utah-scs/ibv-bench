@@ -47,6 +47,7 @@ static const uint32_t MAX_TX_QUEUE_DEPTH = 128;
 
 static const uint32_t MAX_TX_QUEUE_DEPTH_PER_THREAD = 4;
 
+static const double THETA = 0.99
 // With 64 KB seglets 1 MB is fractured into 16 or 17 pieces, plus we
 // need an entry for the headers.
 // 31 seems to be the limit on this. Not sure why, because the qp's are
@@ -227,13 +228,14 @@ class ZipfianGenerator {
      *      smaller the value the more skewed the distribution will be. Default
      *      value of 0.99 comes from the YCSB default value.
      */
-    explicit ZipfianGenerator(uint64_t n, double theta = 0.99)
+    explicit ZipfianGenerator(uint64_t n, double theta = 0.99, size_t seed = 1)
         : n(n)
         , theta(theta)
         , alpha(1 / (1 - theta))
         , zetan(zeta(n, theta))
         , eta((1 - pow(2.0 / static_cast<double>(n), 1 - theta)) /
               (1 - zeta(2, theta) / zetan))
+        , seed(seed)
     {}
 
     /**
@@ -242,7 +244,7 @@ class ZipfianGenerator {
     uint64_t nextNumber()
     {
 	
-	PRNG prng{1};
+	      PRNG prng{seed};
         double u = static_cast<double>(prng.generate()) /
                    static_cast<double>(~0UL);
         double uz = u * zetan;
@@ -260,7 +262,7 @@ class ZipfianGenerator {
     const double alpha;     // Special intermediate result used for generation.
     const double zetan;     // Special intermediate result used for generation.
     const double eta;       // Special intermediate result used for generation.
-
+    const size_t seed;      // Seed for random number generator
     /**
      * Returns the nth harmonic number with parameter theta; e.g. H_{n,theta}.
      */
@@ -1286,7 +1288,7 @@ getTransmitBuffer(size_t threadNum)
     while (true) {
         {
             std::lock_guard<RAMCloud::UnnamedSpinLock>
-	        lock{freeTxBufferMutex[threadNum]};
+  	        lock{freeTxBufferMutex[threadNum]};
             if (!freeTxBuffers[threadNum].empty()) {
                 BufferDescriptor* bd = freeTxBuffers[threadNum].back();
                 freeTxBuffers[threadNum].pop_back();
@@ -1427,6 +1429,7 @@ sendStrictCopy(Chunk* message,
     }
 }
 
+/*
 void
 sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp, bool allowZeroCopy, size_t threadNum)
 {
@@ -1547,6 +1550,7 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
         DIE("ibv_post_send failed");
     }
 }
+*/
 
 /**
  * Asychronously transmit the packet described by 'bd' on queue pair 'qp'.
@@ -1964,7 +1968,7 @@ class Benchmark {
                 nDeltas, deltaSize);
 
         pinTo(threadNum);
-	PRNG prng{threadNum};
+        PRNG prng{threadNum};
         threadState->chunks.resize(nDeltas + nChunks);
         uint32_t start = 0;
 
@@ -2068,6 +2072,7 @@ class Benchmark {
         const uint64_t startTsc = Cycles::rdtsc();
 
         bool refreshChunks = true;
+        bool useZipfian = false;
         uint32_t start = 0;
 	PRNG prng{threadNum};
         while (true) {
@@ -2084,6 +2089,20 @@ class Benchmark {
                     start = start % (logSize - chunkSize);
                     threadState->chunks[i].p = (void*)(logMemoryBase + start);
                     threadState->chunks[i].len = chunkSize;
+                }
+            } else if (useZipfian == true){
+                double theta = THETA;
+                ZipfianGenerator deltaGenerator(logSize - deltaSize, theta, threadNum);
+                ZipfianGenerator chunkGenerator(logSize - chunkSize, theta, threadNum);
+                for (size_t i = 0; i < nDeltas; ++i) {
+                  start = deltaGenerator.nextNumber();
+                  threadState->chunks[i].p = (void*)(logMemoryBase + start);
+                  threadState->chunks[i].len = deltaSize;
+                }
+                for (size_t i = 0; i < nChunks; i++) {
+                  start = chunkGenerator.nextNumber();
+                  threadState->chunks[i].p = (void*)(logMemoryBase + start);
+                  threadState->chunks[i].len = chunkSize;
                 }
             }
 
@@ -2175,9 +2194,9 @@ int main(int argc, const char** argv)
                     args["--runCopyOutOnly"].asBool();
     bool onlyDeltas = false;
     onlyDeltas = (args["--runDeltasOnly"]) &&
-		  args["--runDeltasOnly"].asBool();
+                    args["--runDeltasOnly"].asBool();
     if (onlyDeltas && (onlyZeroCopy || onlyCopyOut)){
-	LOG(ERROR, "When using --runDeltasOnly, can't use other restrictive modes");
+      LOG(ERROR, "When using --runDeltasOnly, can't use other restrictive modes");
     }
     if (onlyZeroCopy && onlyCopyOut){
         LOG(ERROR, "Can't use both --runZeroCopyOnly and --runCopyOutOnly");
