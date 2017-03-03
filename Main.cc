@@ -47,7 +47,11 @@ static const uint32_t MAX_TX_QUEUE_DEPTH = 128;
 
 static const uint32_t MAX_TX_QUEUE_DEPTH_PER_THREAD = 4;
 
-static const double THETA = 0.99
+// Storing a vector of 10 million Zipfian skewed start addresses so as to 
+// not take a perf hit while generating them in critical path;
+static const double THETA = 0.50;
+static const uint32_t MAX_ZIPFIAN_ADDRESSES = 10000000;
+
 // With 64 KB seglets 1 MB is fractured into 16 or 17 pieces, plus we
 // need an entry for the headers.
 // 31 seems to be the limit on this. Not sure why, because the qp's are
@@ -186,6 +190,8 @@ BufferDescriptor txDescriptors[MAX_TX_QUEUE_DEPTH];
 
 std::vector<std::vector<BufferDescriptor*>> freeTxBuffers{};
 std::vector<RAMCloud::UnnamedSpinLock> freeTxBufferMutex;
+std::vector<std::vector<uint32_t>> zipfianChunkAddresses;
+std::vector<std::vector<uint32_t>> zipfianDeltaAddresses;
 
 uintptr_t logMemoryBase = 0;
 size_t logMemoryBytes = 0;
@@ -236,6 +242,7 @@ class ZipfianGenerator {
         , eta((1 - pow(2.0 / static_cast<double>(n), 1 - theta)) /
               (1 - zeta(2, theta) / zetan))
         , seed(seed)
+        , prng{seed}
     {}
 
     /**
@@ -244,7 +251,6 @@ class ZipfianGenerator {
     uint64_t nextNumber()
     {
 	
-	      PRNG prng{seed};
         double u = static_cast<double>(prng.generate()) /
                    static_cast<double>(~0UL);
         double uz = u * zetan;
@@ -263,6 +269,7 @@ class ZipfianGenerator {
     const double zetan;     // Special intermediate result used for generation.
     const double eta;       // Special intermediate result used for generation.
     const size_t seed;      // Seed for random number generator
+    PRNG prng;
     /**
      * Returns the nth harmonic number with parameter theta; e.g. H_{n,theta}.
      */
@@ -1176,7 +1183,8 @@ bool setup(const char* hostName, size_t numThreads)
 
     freeTxBuffers.resize(numThreads);
     freeTxBufferMutex.resize(numThreads);
-
+    zipfianChunkAddresses.resize(numThreads);
+    zipfianDeltaAddresses.resize(numThreads);
     if (hostName) {
         for (auto& bd : txDescriptors)
             freeTxBuffers[0].push_back(&bd);
@@ -1978,7 +1986,7 @@ class Benchmark {
         std::unordered_map<int, uintptr_t> ramCloudHashTable;
 
         ramCloudHashTable.rehash(logSize/chunkSize);
-
+	
         for (size_t i = 0; i < nDeltas; ++i) {
             start = prng.generate();
             start = start % (logSize - deltaSize);
@@ -2006,7 +2014,14 @@ class Benchmark {
                 ramCloudHashTable[i] = logMemoryBase + start;
             }
         }
-
+	LOG(INFO, "Generating Zipfian addresses for thread:%lu",threadNum+1);
+	ZipfianGenerator chunksGenerator(logSize - chunkSize, THETA, threadNum);
+	ZipfianGenerator deltasGenerator(logSize - deltaSize, THETA, threadNum);
+	for (size_t i=0;i<MAX_ZIPFIAN_ADDRESSES;i++){
+		zipfianChunkAddresses[threadNum].push_back(chunksGenerator.nextNumber());
+		zipfianDeltaAddresses[threadNum].push_back(deltasGenerator.nextNumber());
+	}
+	LOG(INFO, "Generated Zipfian addresses for thread:%lu",threadNum+1);
         // If this is a migration test, perform a few operations (reads and
         // writes) before proceeding.
         if (deltaSize == 0 && runSimulateWorkload == true) {
@@ -2050,7 +2065,6 @@ class Benchmark {
         int writePercent = 100;
         int numOperations = 100;
         ZipfianGenerator generator(nChunks, theta);
-
         srand(time(NULL));
 
         for (int i = 0; i < numOperations; i++) {
@@ -2068,13 +2082,15 @@ class Benchmark {
     }
 
     void run(ThreadState* threadState, double seconds, size_t threadNum) {
-        const uint64_t cyclesToRun = Cycles::fromSeconds(seconds);
-        const uint64_t startTsc = Cycles::rdtsc();
-
-        bool refreshChunks = true;
-        bool useZipfian = false;
+        LOG(INFO, "In run %lu", threadNum);
+	const uint64_t cyclesToRun = Cycles::fromSeconds(seconds);
+        bool refreshChunks = false;
+        bool useZipfian = true;
         uint32_t start = 0;
 	PRNG prng{threadNum};
+	uint32_t zipfChunkOffset = 0;
+	uint32_t zipfDeltaOffset = 0;
+        const uint64_t startTsc = Cycles::rdtsc();
         while (true) {
             if (refreshChunks == true) {
                 for (size_t i = 0; i < nDeltas; ++i) {
@@ -2091,17 +2107,22 @@ class Benchmark {
                     threadState->chunks[i].len = chunkSize;
                 }
             } else if (useZipfian == true){
-                double theta = THETA;
-                ZipfianGenerator deltaGenerator(logSize - deltaSize, theta, threadNum);
-                ZipfianGenerator chunkGenerator(logSize - chunkSize, theta, threadNum);
-                for (size_t i = 0; i < nDeltas; ++i) {
-                  start = deltaGenerator.nextNumber();
+	       for (size_t i = 0; i < nDeltas; ++i) {
+                  start = zipfianDeltaAddresses[threadNum][zipfDeltaOffset];
+		  ++zipfDeltaOffset;
+		  if (zipfDeltaOffset>=MAX_ZIPFIAN_ADDRESSES){
+		  zipfDeltaOffset = 0;
+		  }
                   threadState->chunks[i].p = (void*)(logMemoryBase + start);
                   threadState->chunks[i].len = deltaSize;
                 }
                 for (size_t i = 0; i < nChunks; i++) {
-                  start = chunkGenerator.nextNumber();
-                  threadState->chunks[i].p = (void*)(logMemoryBase + start);
+		  start = zipfianChunkAddresses[threadNum][zipfChunkOffset];
+		  ++zipfChunkOffset;
+		  if (zipfChunkOffset>=MAX_ZIPFIAN_ADDRESSES){
+		  zipfChunkOffset = 0;
+		  }
+	          threadState->chunks[i].p = (void*)(logMemoryBase + start);
                   threadState->chunks[i].len = chunkSize;
                 }
             }
