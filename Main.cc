@@ -31,6 +31,9 @@
 #include "LargeBlockOfMemory.h"
 #include "CycleCounter.h"
 #include "SpinLock.h"
+
+#include <fstream>
+#include <iterator>
 #define ZIPFIAN_SETUP 1
 
 static const int PORT = 12240;
@@ -52,6 +55,13 @@ static const uint32_t MAX_TX_QUEUE_DEPTH_PER_THREAD = 4;
 // not take a perf hit while generating them in critical path;
 static const double THETA = 0.50;
 static const uint32_t MAX_ZIPFIAN_ADDRESSES = 10000000;
+
+void write_vector_to_file(std::vector<uint32_t> *v, const char *path) {
+    std::ofstream output_file(path);
+    std::ostream_iterator<int> output_iterator(output_file, "\n");
+    std::copy(v->begin(), v->end(), output_iterator);
+}
+
 
 // With 64 KB seglets 1 MB is fractured into 16 or 17 pieces, plus we
 // need an entry for the headers.
@@ -2027,6 +2037,10 @@ class Benchmark {
 		zipfianDeltaAddresses[threadNum].push_back(deltasGenerator.nextNumber());
 	}
 	LOG(INFO, "Generated Zipfian addresses for thread:%lu",threadNum+1);
+	LOG(INFO, "Writing vector to files");
+	std::stringstream outputfile;
+	outputfile<<"vector_thread_"<<threadNum+1<<".txt";
+        write_vector_to_file(&zipfianChunkAddresses[threadNum], outputfile.str().c_str());
 #endif 
         // If this is a migration test, perform a few operations (reads and
         // writes) before proceeding.
@@ -2037,6 +2051,7 @@ class Benchmark {
         nReady++;
         while (!go);
 
+	DIE("wrote stuff, my purpose is done");		
         // warmup
         //run(threadState, warmupSeconds, threadNum);
 
