@@ -31,6 +31,7 @@
 #include "LargeBlockOfMemory.h"
 #include "CycleCounter.h"
 #include "SpinLock.h"
+#define ZIPFIAN_SETUP 1
 
 static const int PORT = 12240;
 
@@ -1183,8 +1184,10 @@ bool setup(const char* hostName, size_t numThreads)
 
     freeTxBuffers.resize(numThreads);
     freeTxBufferMutex.resize(numThreads);
+#if defined ZIPFIAN_SETUP && ZIPFIAN_SETUP == 1
     zipfianChunkAddresses.resize(numThreads);
     zipfianDeltaAddresses.resize(numThreads);
+#endif
     if (hostName) {
         for (auto& bd : txDescriptors)
             freeTxBuffers[0].push_back(&bd);
@@ -2014,6 +2017,8 @@ class Benchmark {
                 ramCloudHashTable[i] = logMemoryBase + start;
             }
         }
+// Costly filling up of Zipfian vectors
+#if defined ZIPFIAN_SETUP && ZIPFIAN_SETUP == 1 
 	LOG(INFO, "Generating Zipfian addresses for thread:%lu",threadNum+1);
 	ZipfianGenerator chunksGenerator(logSize - chunkSize, THETA, threadNum);
 	ZipfianGenerator deltasGenerator(logSize - deltaSize, THETA, threadNum);
@@ -2022,6 +2027,7 @@ class Benchmark {
 		zipfianDeltaAddresses[threadNum].push_back(deltasGenerator.nextNumber());
 	}
 	LOG(INFO, "Generated Zipfian addresses for thread:%lu",threadNum+1);
+#endif 
         // If this is a migration test, perform a few operations (reads and
         // writes) before proceeding.
         if (deltaSize == 0 && runSimulateWorkload == true) {
@@ -2085,11 +2091,12 @@ class Benchmark {
         LOG(INFO, "In run %lu", threadNum);
 	const uint64_t cyclesToRun = Cycles::fromSeconds(seconds);
         bool refreshChunks = false;
-        bool useZipfian = true;
         uint32_t start = 0;
 	PRNG prng{threadNum};
+#if defined ZIPFIAN_SETUP && ZIPFIAN_SETUP == 1
 	uint32_t zipfChunkOffset = 0;
 	uint32_t zipfDeltaOffset = 0;
+#endif
         const uint64_t startTsc = Cycles::rdtsc();
         while (true) {
             if (refreshChunks == true) {
@@ -2106,7 +2113,8 @@ class Benchmark {
                     threadState->chunks[i].p = (void*)(logMemoryBase + start);
                     threadState->chunks[i].len = chunkSize;
                 }
-            } else if (useZipfian == true){
+            }
+#if defined ZIPFIAN_SETUP && ZIPFIAN_SETUP == 1
 	       for (size_t i = 0; i < nDeltas; ++i) {
                   start = zipfianDeltaAddresses[threadNum][zipfDeltaOffset];
 		  ++zipfDeltaOffset;
@@ -2125,8 +2133,7 @@ class Benchmark {
 	          threadState->chunks[i].p = (void*)(logMemoryBase + start);
                   threadState->chunks[i].len = chunkSize;
                 }
-            }
-
+#endif
             //sendZeroCopy(&threadState->chunks[0], nChunks, nChunks * chunkSize,
             //             threadState->qp.get(), doZeroCopy, threadNum);
             if (doZeroCopy) {
