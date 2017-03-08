@@ -1,11 +1,12 @@
 #!/bin/bash
-for profile in {membw,ddiobw,pciebw}
+
+for size in {128,1024}
   do
-  for chunks in {1..32}
+  for profile in {membw,ddiobw,pciebw}
     do
-    for size in {128,1024}
+    for chunks in {1..32}
       do
-      for filter in {--nocopyout,--nozerocopy,--onlydeltas}
+      for filter in {--nocopyout,--nozerocopy}
         do 
         #python scripts/emulab.py `hostname` --profile=$profile $filter true --seconds=90 --chunks=$chunks --size=$size --profileinterval 100 > run-$profile-$filter-$chunks-$size.log 2>&1
         python scripts/emulab.py `hostname` --profile=$profile $filter true --seconds=90 --chunks=$chunks --size=$size --profileinterval 100
