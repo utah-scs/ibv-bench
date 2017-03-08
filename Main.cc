@@ -58,7 +58,7 @@ static const uint32_t MAX_ZIPFIAN_ADDRESSES = 10000000;
 
 void write_vector_to_file(std::vector<uint32_t> *v, const char *path) {
     std::ofstream output_file(path);
-    std::ostream_iterator<int> output_iterator(output_file, "\n");
+    std::ostream_iterator<uint32_t> output_iterator(output_file, "\n");
     std::copy(v->begin(), v->end(), output_iterator);
 }
 
@@ -245,7 +245,7 @@ class ZipfianGenerator {
      *      smaller the value the more skewed the distribution will be. Default
      *      value of 0.99 comes from the YCSB default value.
      */
-    explicit ZipfianGenerator(uint64_t n, double theta = 0.99, size_t seed = 1)
+    explicit ZipfianGenerator(uint32_t n, double theta = 0.99, size_t seed = 1)
         : n(n)
         , theta(theta)
         , alpha(1 / (1 - theta))
@@ -259,22 +259,23 @@ class ZipfianGenerator {
     /**
      * Return the zipfian distributed random number between 0 and n-1.
      */
-    uint64_t nextNumber()
+    uint32_t nextNumber()
     {
-	
-        double u = static_cast<double>(prng.generate()) /
-                   static_cast<double>(~0UL);
+	uint32_t random;
+	random = prng.generate();	
+        double u = static_cast<double>(random) /
+                   static_cast<double>(~0U);
         double uz = u * zetan;
         if (uz < 1)
             return 0;
         if (uz < 1 + std::pow(0.5, theta))
             return 1;
-        return 0 + static_cast<uint64_t>(static_cast<double>(n) *
+        return 0 + static_cast<uint32_t>(static_cast<double>(n) *
                                          std::pow(eta*u - eta + 1.0, alpha));
     }
 
   private:
-    const uint64_t n;       // Range of numbers to be generated.
+    const uint32_t n;       // Range of numbers to be generated.
     const double theta;     // Parameter of the zipfian distribution.
     const double alpha;     // Special intermediate result used for generation.
     const double zetan;     // Special intermediate result used for generation.
@@ -284,10 +285,10 @@ class ZipfianGenerator {
     /**
      * Returns the nth harmonic number with parameter theta; e.g. H_{n,theta}.
      */
-    static double zeta(uint64_t n, double theta)
+    static double zeta(uint32_t n, double theta)
     {
         double sum = 0;
-        for (uint64_t i = 0; i < n; i++) {
+        for (uint32_t i = 0; i < n; i++) {
             sum = sum + 1.0/(std::pow(i+1, theta));
         }
         return sum;
@@ -2030,9 +2031,11 @@ class Benchmark {
 // Costly filling up of Zipfian vectors
 #if defined ZIPFIAN_SETUP && ZIPFIAN_SETUP == 1 
 	LOG(INFO, "Generating Zipfian addresses for thread:%lu",threadNum+1);
-	ZipfianGenerator chunksGenerator(logSize - chunkSize, THETA, threadNum);
-	ZipfianGenerator deltasGenerator(logSize - deltaSize, THETA, threadNum);
-	for (size_t i=0;i<MAX_ZIPFIAN_ADDRESSES;i++){
+	uint32_t chunkOffsets = (logSize/chunkSize) - 1;
+	uint32_t deltaOffsets = ((deltaSize==0)?0:(logSize/deltaSize) - 1);
+	ZipfianGenerator chunksGenerator(chunkOffsets, THETA, threadNum);
+	ZipfianGenerator deltasGenerator(deltaOffsets, THETA, threadNum);
+	for (uint32_t i=0;i<MAX_ZIPFIAN_ADDRESSES;i++){
 		zipfianChunkAddresses[threadNum].push_back(chunksGenerator.nextNumber());
 		zipfianDeltaAddresses[threadNum].push_back(deltasGenerator.nextNumber());
 	}
@@ -2050,8 +2053,6 @@ class Benchmark {
 
         nReady++;
         while (!go);
-
-	DIE("wrote stuff, my purpose is done");		
         // warmup
         //run(threadState, warmupSeconds, threadNum);
 
@@ -2105,7 +2106,7 @@ class Benchmark {
     void run(ThreadState* threadState, double seconds, size_t threadNum) {
         LOG(INFO, "In run %lu", threadNum);
 	const uint64_t cyclesToRun = Cycles::fromSeconds(seconds);
-        bool refreshChunks = false;
+        //bool refreshChunks = false;
         uint32_t start = 0;
 	PRNG prng{threadNum};
 #if defined ZIPFIAN_SETUP && ZIPFIAN_SETUP == 1
@@ -2114,7 +2115,27 @@ class Benchmark {
 #endif
         const uint64_t startTsc = Cycles::rdtsc();
         while (true) {
-            if (refreshChunks == true) {
+
+#if defined ZIPFIAN_SETUP && ZIPFIAN_SETUP == 1
+	       for (size_t i = 0; i < nDeltas; ++i) {
+                  start = zipfianDeltaAddresses[threadNum][zipfDeltaOffset];
+		  ++zipfDeltaOffset;
+		  if (zipfDeltaOffset>=MAX_ZIPFIAN_ADDRESSES){
+		  zipfDeltaOffset = 0;
+		  }
+                  threadState->chunks[i].p = (void*)(logMemoryBase + (start * deltaSize));
+                  threadState->chunks[i].len = deltaSize;
+                }
+                for (size_t i = 0; i < nChunks; i++) {
+		  start = zipfianChunkAddresses[threadNum][zipfChunkOffset];
+		  ++zipfChunkOffset;
+		  if (zipfChunkOffset>=MAX_ZIPFIAN_ADDRESSES){
+		  zipfChunkOffset = 0;
+		  }
+	          threadState->chunks[i].p = (void*)(logMemoryBase + (start * chunkSize));
+                  threadState->chunks[i].len = chunkSize;
+                }
+#else
                 for (size_t i = 0; i < nDeltas; ++i) {
                     start = prng.generate();
                     start = start % (logSize - deltaSize);
@@ -2127,26 +2148,6 @@ class Benchmark {
                     start = start % (logSize - chunkSize);
                     threadState->chunks[i].p = (void*)(logMemoryBase + start);
                     threadState->chunks[i].len = chunkSize;
-                }
-            }
-#if defined ZIPFIAN_SETUP && ZIPFIAN_SETUP == 1
-	       for (size_t i = 0; i < nDeltas; ++i) {
-                  start = zipfianDeltaAddresses[threadNum][zipfDeltaOffset];
-		  ++zipfDeltaOffset;
-		  if (zipfDeltaOffset>=MAX_ZIPFIAN_ADDRESSES){
-		  zipfDeltaOffset = 0;
-		  }
-                  threadState->chunks[i].p = (void*)(logMemoryBase + start);
-                  threadState->chunks[i].len = deltaSize;
-                }
-                for (size_t i = 0; i < nChunks; i++) {
-		  start = zipfianChunkAddresses[threadNum][zipfChunkOffset];
-		  ++zipfChunkOffset;
-		  if (zipfChunkOffset>=MAX_ZIPFIAN_ADDRESSES){
-		  zipfChunkOffset = 0;
-		  }
-	          threadState->chunks[i].p = (void*)(logMemoryBase + start);
-                  threadState->chunks[i].len = chunkSize;
                 }
 #endif
             //sendZeroCopy(&threadState->chunks[0], nChunks, nChunks * chunkSize,
