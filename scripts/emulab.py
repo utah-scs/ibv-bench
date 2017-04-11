@@ -206,6 +206,10 @@ class BenchmarkRunner(object):
         return procs
 
     def killall(self):
+        """ WARNING: This is not sufficient to kill ucevent profiling processes
+        gracefully. Please use the steps from run-all.sh to clean up profile processes 
+        after each run.
+        """
         #getpid_cmd = 'ssh %s "ps axf | grep python | grep ucevent |grep -v bash|grep -v ssh| cut -d \'?\' -f1"' % self.host_names[0] 
         #pid=subprocess.check_output(getpid_cmd,shell=True)
         #pid = " ".join(pid.strip().split("\n"))

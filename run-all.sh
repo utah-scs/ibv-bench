@@ -1,5 +1,5 @@
 #!/bin/bash
-
+# replace the for loops to limit runs.
 for size in {128,1024}
   do
   for profile in {membw,ddiobw,pciebw}

@@ -52,7 +52,8 @@ static const uint32_t MAX_TX_QUEUE_DEPTH = 128;
 static const uint32_t MAX_TX_QUEUE_DEPTH_PER_THREAD = 4;
 
 // Storing a vector of 10 million Zipfian skewed start addresses so as to 
-// not take a perf hit while generating them in critical path;
+// not take a perf hit while generating them in critical path
+// Change the theta value here to adjust skew
 static const double THETA = 0.50;
 static const uint32_t MAX_ZIPFIAN_ADDRESSES = 10000000;
 
@@ -232,7 +233,7 @@ void pinAllMemory() {
     }
 }
 
-// XXX Lobotomized from RAMCloud/src/ClusterPerf.cc
+// Lobotomized and injected with custom PRNG from RAMCloud/src/ClusterPerf.cc
 class ZipfianGenerator {
   public:
     /**
@@ -2206,9 +2207,9 @@ R"(ibv-bench.
       --runCopyOutOnly              Don't run Zero Copy mode
       --runDeltasOnly               Only Run Delta Experiments
       --minChunkSize=SIZE           Smallest size of individual objects [default: 1]
-      --maxChunkSize=SIZE           Smallest size of individual objects [default: 1024]
-      --minChunksPerMessage=CHUNKS  Min Number of objects to send per send [default: 1]
-      --maxChunksPerMessage=CHUNKS  Max number of objects to send per send [default: 32]
+      --maxChunkSize=SIZE           Largest size of individual objects [default: 1024]
+      --minChunksPerMessage=CHUNKS  Min Number of objects to transmit per send [default: 1]
+      --maxChunksPerMessage=CHUNKS  Max number of objects to transmit per send [default: 32]
       --seconds=SECONDS             Number of seconds to run per chunk count/size pair [default: 10]
       --warmup=SECONDS              Number of seconds to run per chunk count/size pair before starting measurment [default: 5]
 )";
