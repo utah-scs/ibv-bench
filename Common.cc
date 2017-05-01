@@ -1,6 +1,7 @@
 #include "Common.h"
 
 #include <stdexcept>
+
 /* Seeds obtained after sufficient offset into a single threaded run */
 static uint32_t prngInitVals[16][4] = {
   [0] = { 0xf1e86518, 0x817271fa, 0xa8268e81, 0xb8627c85 },

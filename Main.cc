@@ -2002,6 +2002,8 @@ class Benchmark {
 
         ramCloudHashTable.rehash(logSize/chunkSize);
 	
+        PRNG prng{threadNum};
+
         for (size_t i = 0; i < nDeltas; ++i) {
             start = prng.generate();
             start = start % (logSize - deltaSize);
