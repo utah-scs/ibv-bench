@@ -9,6 +9,7 @@
 #include <cassert>
 #include <deque>
 #include <atomic>
+#include <time.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -21,6 +22,7 @@
 #include <iostream>
 #include <map>
 #include <algorithm>
+#include <unordered_map>
 
 #include "docopt.h"
 
@@ -29,6 +31,10 @@
 #include "LargeBlockOfMemory.h"
 #include "CycleCounter.h"
 #include "SpinLock.h"
+
+#include <fstream>
+#include <iterator>
+#define ZIPFIAN_SETUP 1
 
 static const int PORT = 12240;
 
@@ -42,6 +48,21 @@ static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 32;
 // which results in a higher number of on-controller cache misses.
 static const uint32_t MAX_SHARED_RX_SGE_COUNT = 1;
 static const uint32_t MAX_TX_QUEUE_DEPTH = 128;
+
+static const uint32_t MAX_TX_QUEUE_DEPTH_PER_THREAD = 4;
+
+// Storing a vector of 10 million Zipfian skewed start addresses so as to 
+// not take a perf hit while generating them in critical path
+// Change the theta value here to adjust skew
+static const double THETA = 0.50;
+static const uint32_t MAX_ZIPFIAN_ADDRESSES = 10000000;
+
+void write_vector_to_file(std::vector<uint32_t> *v, const char *path) {
+    std::ofstream output_file(path);
+    std::ostream_iterator<uint32_t> output_iterator(output_file, "\n");
+    std::copy(v->begin(), v->end(), output_iterator);
+}
+
 
 // With 64 KB seglets 1 MB is fractured into 16 or 17 pieces, plus we
 // need an entry for the headers.
@@ -164,11 +185,13 @@ struct BufferDescriptor {
     uint32_t        bytes;          // length of buffer in bytes
     uint32_t        messageBytes;   // byte length of message in the buffer
     ibv_mr *        mr;             // memory region of the buffer
+    size_t          threadNum;      // The thread using this buffer (client)
 
-    BufferDescriptor(char *buffer, uint32_t bytes, ibv_mr *mr)
-        : buffer(buffer), bytes(bytes), messageBytes(0), mr(mr) {}
+    BufferDescriptor(char *buffer, uint32_t bytes, ibv_mr *mr, size_t threadNum)
+        : buffer(buffer), bytes(bytes), messageBytes(0), mr(mr),
+	  threadNum(threadNum) {}
     BufferDescriptor()
-        : buffer(NULL), bytes(0), messageBytes(0), mr(NULL) {}
+        : buffer(NULL), bytes(0), messageBytes(0), mr(NULL), threadNum(0) {}
 };
 
 void* rxBase;
@@ -177,8 +200,10 @@ BufferDescriptor rxDescriptors[MAX_SHARED_RX_QUEUE_DEPTH * 2];
 void* txBase;
 BufferDescriptor txDescriptors[MAX_TX_QUEUE_DEPTH];
 
-std::vector<BufferDescriptor*> freeTxBuffers{};
-RAMCloud::SpinLock freeTxBufferMutex("freeTxBuffers");
+std::vector<std::vector<BufferDescriptor*>> freeTxBuffers{};
+std::vector<RAMCloud::UnnamedSpinLock> freeTxBufferMutex;
+std::vector<std::vector<uint32_t>> zipfianChunkAddresses;
+std::vector<std::vector<uint32_t>> zipfianDeltaAddresses;
 
 uintptr_t logMemoryBase = 0;
 size_t logMemoryBytes = 0;
@@ -207,6 +232,69 @@ void pinAllMemory() {
                      strerror(errno));
     }
 }
+
+// Lobotomized and injected with custom PRNG from RAMCloud/src/ClusterPerf.cc
+class ZipfianGenerator {
+  public:
+    /**
+     * Construct a generator.  This may be expensive if n is large.
+     *
+     * \param n
+     *      The generator will output random numbers between 0 and n-1.
+     * \param theta
+     *      The zipfian parameter where 0 < theta < 1 defines the skew; the
+     *      smaller the value the more skewed the distribution will be. Default
+     *      value of 0.99 comes from the YCSB default value.
+     */
+    explicit ZipfianGenerator(uint32_t n, double theta = 0.99, size_t seed = 1)
+        : n(n)
+        , theta(theta)
+        , alpha(1 / (1 - theta))
+        , zetan(zeta(n, theta))
+        , eta((1 - pow(2.0 / static_cast<double>(n), 1 - theta)) /
+              (1 - zeta(2, theta) / zetan))
+        , seed(seed)
+        , prng{seed}
+    {}
+
+    /**
+     * Return the zipfian distributed random number between 0 and n-1.
+     */
+    uint32_t nextNumber()
+    {
+	uint32_t random;
+	random = prng.generate();	
+        double u = static_cast<double>(random) /
+                   static_cast<double>(~0U);
+        double uz = u * zetan;
+        if (uz < 1)
+            return 0;
+        if (uz < 1 + std::pow(0.5, theta))
+            return 1;
+        return 0 + static_cast<uint32_t>(static_cast<double>(n) *
+                                         std::pow(eta*u - eta + 1.0, alpha));
+    }
+
+  private:
+    const uint32_t n;       // Range of numbers to be generated.
+    const double theta;     // Parameter of the zipfian distribution.
+    const double alpha;     // Special intermediate result used for generation.
+    const double zetan;     // Special intermediate result used for generation.
+    const double eta;       // Special intermediate result used for generation.
+    const size_t seed;      // Seed for random number generator
+    PRNG prng;
+    /**
+     * Returns the nth harmonic number with parameter theta; e.g. H_{n,theta}.
+     */
+    static double zeta(uint32_t n, double theta)
+    {
+        double sum = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            sum = sum + 1.0/(std::pow(i+1, theta));
+        }
+        return sum;
+    }
+};
 
 // XXX Lobotomized for now.
 class Address {
@@ -358,7 +446,7 @@ QueuePair::QueuePair(ibv_qp_type type,
     qpia.srq = srq;                    // use the same shared receive queue
     qpia.cap.max_send_wr  = maxSendWr; // max outstanding send requests
     qpia.cap.max_recv_wr  = maxRecvWr; // max outstanding recv requests
-    qpia.cap.max_send_sge = 32;         // max send scatter-gather elements
+    qpia.cap.max_send_sge = 32;        // max send scatter-gather elements
     qpia.cap.max_recv_sge = 1;         // max recv scatter-gather elements
     qpia.cap.max_inline_data =         // max bytes of immediate data on send q
         MAX_INLINE_DATA;
@@ -824,7 +912,8 @@ void
 createBuffers(void** ppBase,
               BufferDescriptor descriptors[],
               uint32_t bufferSize,
-              uint32_t bufferCount)
+              uint32_t bufferCount,
+              size_t threadNum)
 {
     const size_t bytes = bufferSize * bufferCount;
     *ppBase = xmemalign(4096, bytes);
@@ -839,7 +928,8 @@ createBuffers(void** ppBase,
 
     char* buffer = static_cast<char*>(*ppBase);
     for (uint32_t i = 0; i < bufferCount; ++i) {
-        new(&descriptors[i]) BufferDescriptor(buffer, bufferSize, mr);
+        new(&descriptors[i]) BufferDescriptor(buffer, bufferSize, mr,
+		threadNum);
         buffer += bufferSize;
     }
 }
@@ -985,7 +1075,7 @@ pollSocket()
  * \param hostName
  *      nullptr for clients or the hostname to listen for incoming QP reqs on.
  */
-bool setup(const char* hostName)
+bool setup(const char* hostName, size_t numThreads)
 {
     clientSetupSocket = socket(PF_INET, SOCK_DGRAM, 0);
     if (clientSetupSocket == -1) {
@@ -1090,7 +1180,7 @@ bool setup(const char* hostName)
     uint32_t bufferSize = ((1u << 23) + 4095) & ~0xfff;
 
     createBuffers(&rxBase, rxDescriptors, bufferSize,
-                  uint32_t(MAX_SHARED_RX_QUEUE_DEPTH * 2));
+                  uint32_t(MAX_SHARED_RX_QUEUE_DEPTH * 2), 0);
     uint32_t j = 0;
     for (auto& bd : rxDescriptors) {
         if (j < MAX_SHARED_RX_QUEUE_DEPTH)
@@ -1102,9 +1192,25 @@ bool setup(const char* hostName)
     //assert(numUsedClientSrqBuffers == 0);
 
     createBuffers(&txBase, txDescriptors,
-                  bufferSize, uint32_t(MAX_TX_QUEUE_DEPTH));
-    for (auto& bd : txDescriptors)
-        freeTxBuffers.push_back(&bd);
+        bufferSize, uint32_t(MAX_TX_QUEUE_DEPTH), 0);
+
+    freeTxBuffers.resize(numThreads);
+    freeTxBufferMutex.resize(numThreads);
+#if defined ZIPFIAN_SETUP && ZIPFIAN_SETUP == 1
+    zipfianChunkAddresses.resize(numThreads);
+    zipfianDeltaAddresses.resize(numThreads);
+#endif
+    if (hostName) {
+        for (auto& bd : txDescriptors)
+            freeTxBuffers[0].push_back(&bd);
+    } else {
+        for (size_t i = 0, j = 0; i < numThreads; ++i) {
+            for (size_t k = 0; k < MAX_TX_QUEUE_DEPTH_PER_THREAD; ++k, ++j) {
+                txDescriptors[j].threadNum = i;
+                freeTxBuffers[i].push_back(&(txDescriptors[j]));
+            }
+        }
+    }
 
     // create completion queues for server receive, client receive, and
     // server/client transmit
@@ -1171,14 +1277,17 @@ reapTxBuffers()
     ibv_wc retArray[MAX_TX_QUEUE_DEPTH];
     int n = ibv_poll_cq(commonTxCq, MAX_TX_QUEUE_DEPTH, retArray);
 
-    std::lock_guard<RAMCloud::SpinLock> lock{freeTxBufferMutex};
     for (int i = 0; i < n; i++) {
         BufferDescriptor* bd =
             reinterpret_cast<BufferDescriptor*>(retArray[i].wr_id);
         if (bd == nullptr)
             continue;
 
-        freeTxBuffers.push_back(bd);
+        size_t threadNum = bd->threadNum;
+
+        std::lock_guard<RAMCloud::UnnamedSpinLock>
+		lock{freeTxBufferMutex[threadNum]};
+        freeTxBuffers[threadNum].push_back(bd);
 
         if (retArray[i].status != IBV_WC_SUCCESS) {
             LOG(ERROR, "Transmit failed for buffer %lu: %s",
@@ -1196,15 +1305,16 @@ reapTxBuffers()
 }
 
 BufferDescriptor*
-getTransmitBuffer()
+getTransmitBuffer(size_t threadNum)
 {
     CycleCounter<> transmitCounter{&threadMetrics.getTransmitCycles};
     while (true) {
         {
-            std::lock_guard<RAMCloud::SpinLock> lock{freeTxBufferMutex};
-            if (!freeTxBuffers.empty()) {
-                BufferDescriptor* bd = freeTxBuffers.back();
-                freeTxBuffers.pop_back();
+            std::lock_guard<RAMCloud::UnnamedSpinLock>
+  	        lock{freeTxBufferMutex[threadNum]};
+            if (!freeTxBuffers[threadNum].empty()) {
+                BufferDescriptor* bd = freeTxBuffers[threadNum].back();
+                freeTxBuffers[threadNum].pop_back();
                 return bd;
             }
         }
@@ -1222,9 +1332,10 @@ void
 sendStrictZeroCopy(Chunk* message,
                    uint32_t chunkCount,
                    uint32_t messageLen,
-                   QueuePair* qp)
+                   QueuePair* qp,
+                   size_t threadNum)
 {
-    BufferDescriptor* bd = getTransmitBuffer();
+    BufferDescriptor* bd = getTransmitBuffer(threadNum);
     bd->messageBytes = messageLen;
 
     ibv_sge isge[MAX_TX_SGE_COUNT];
@@ -1290,9 +1401,10 @@ void
 sendStrictCopy(Chunk* message,
                uint32_t chunkCount,
                uint32_t messageLen,
-               QueuePair* qp)
+               QueuePair* qp,
+               size_t threadNum)
 {
-    BufferDescriptor* bd = getTransmitBuffer();
+    BufferDescriptor* bd = getTransmitBuffer(threadNum);
     bd->messageBytes = messageLen;
 
     {
@@ -1340,10 +1452,11 @@ sendStrictCopy(Chunk* message,
     }
 }
 
+/*
 void
-sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp, bool allowZeroCopy)
+sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp, bool allowZeroCopy, size_t threadNum)
 {
-    BufferDescriptor* bd = getTransmitBuffer();
+    BufferDescriptor* bd = getTransmitBuffer(threadNum);
     bd->messageBytes = messageLen;
 
     uint32_t chunksUsed = 0;
@@ -1460,6 +1573,7 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
         DIE("ibv_post_send failed");
     }
 }
+*/
 
 /**
  * Asychronously transmit the packet described by 'bd' on queue pair 'qp'.
@@ -1767,9 +1881,9 @@ poll()
     // until buffers are running low before trying to reclaim.  This
     // optimization improves the throughput of "clusterperf readThroughput"
     // by about 5% (as of 7/2015).
-    if (freeTxBuffers.size() < 3) {
+    if (freeTxBuffers[0].size() < 3) {
         reapTxBuffers();
-        if (freeTxBuffers.size() >= 3) {
+        if (freeTxBuffers[0].size() >= 3) {
             foundWork = 1;
         }
     }
@@ -1864,8 +1978,10 @@ class Benchmark {
         for (auto& thread : threads)
             thread.join();
 
-        while (freeTxBuffers.size() < MAX_TX_QUEUE_DEPTH)
-            reapTxBuffers();
+        for (size_t i = 0; i < servers.size(); ++i) {
+            while (freeTxBuffers[i].size() < MAX_TX_QUEUE_DEPTH_PER_THREAD)
+                reapTxBuffers();
+        }
     }
 
     void entry(size_t threadNum, ThreadState* threadState) {
@@ -1875,10 +1991,17 @@ class Benchmark {
                 nDeltas, deltaSize);
 
         pinTo(threadNum);
-
+        PRNG prng{threadNum};
         threadState->chunks.resize(nDeltas + nChunks);
         uint32_t start = 0;
 
+        bool preTouchChunks = false;
+        bool runSimulateWorkload = false;
+
+        std::unordered_map<int, uintptr_t> ramCloudHashTable;
+
+        ramCloudHashTable.rehash(logSize/chunkSize);
+	
         PRNG prng{threadNum};
 
         for (size_t i = 0; i < nDeltas; ++i) {
@@ -1886,6 +2009,11 @@ class Benchmark {
             start = start % (logSize - deltaSize);
             threadState->chunks[i].p = (void*)(logMemoryBase + start);
             threadState->chunks[i].len = deltaSize;
+
+            if (preTouchChunks == true) {
+                memset(threadState->chunks[i].p, nDeltas + deltaSize,
+                    threadState->chunks[i].len);
+            }
         }
 
         for (size_t i = 0; i < nChunks; ++i) {
@@ -1893,20 +2021,50 @@ class Benchmark {
             start = start % (logSize - chunkSize);
             threadState->chunks[i].p = (void*)(logMemoryBase + start);
             threadState->chunks[i].len = chunkSize;
+
+            if (preTouchChunks == true) {
+                memset(threadState->chunks[i].p, nChunks + chunkSize,
+                    threadState->chunks[i].len);
+            }
+
+            if (runSimulateWorkload == true) {
+                ramCloudHashTable[i] = logMemoryBase + start;
+            }
+        }
+// Costly filling up of Zipfian vectors
+#if defined ZIPFIAN_SETUP && ZIPFIAN_SETUP == 1 
+	LOG(INFO, "Generating Zipfian addresses for thread:%lu",threadNum+1);
+	uint32_t chunkOffsets = (logSize/chunkSize) - 1;
+	uint32_t deltaOffsets = ((deltaSize==0)?0:(logSize/deltaSize) - 1);
+	ZipfianGenerator chunksGenerator(chunkOffsets, THETA, threadNum);
+	ZipfianGenerator deltasGenerator(deltaOffsets, THETA, threadNum);
+	for (uint32_t i=0;i<MAX_ZIPFIAN_ADDRESSES;i++){
+		zipfianChunkAddresses[threadNum].push_back(chunksGenerator.nextNumber());
+		zipfianDeltaAddresses[threadNum].push_back(deltasGenerator.nextNumber());
+	}
+	LOG(INFO, "Generated Zipfian addresses for thread:%lu",threadNum+1);
+	LOG(INFO, "Writing vector to files");
+	std::stringstream outputfile;
+	outputfile<<"vector_thread_"<<threadNum+1<<".txt";
+        write_vector_to_file(&zipfianChunkAddresses[threadNum], outputfile.str().c_str());
+#endif 
+        // If this is a migration test, perform a few operations (reads and
+        // writes) before proceeding.
+        if (deltaSize == 0 && runSimulateWorkload == true) {
+            simulateWorkload(threadState, ramCloudHashTable);
         }
 
         nReady++;
         while (!go);
-
         // warmup
-        run(threadState, warmupSeconds);
+        //run(threadState, warmupSeconds, threadNum);
 
         threadMetrics.reset();
 
         uint64_t cycles = 0;
         {
             CycleCounter<> counter{&cycles};
-            run(threadState, seconds);
+            run(threadState, seconds, threadNum);
         }
 
         threadMetrics.dump(!doZeroCopy, threadState->qp->getPeerName(),
@@ -1926,24 +2084,91 @@ class Benchmark {
         }
     }
 
-    void run(ThreadState* threadState, double seconds) {
-        const uint64_t cyclesToRun = Cycles::fromSeconds(seconds);
-        const uint64_t start = Cycles::rdtsc();
+    void simulateWorkload(ThreadState* threadState,
+        std::unordered_map<int, uintptr_t> ramCloudHashTable) {
+        double theta = 0.5;
+        int writePercent = 100;
+        int numOperations = 100;
+        ZipfianGenerator generator(nChunks, theta);
+        srand(time(NULL));
+
+        for (int i = 0; i < numOperations; i++) {
+            uint64_t lookupRecord = generator.nextNumber();
+            uintptr_t recordAddress = 0;
+
+            if (rand() % 100 < 100 - writePercent) {
+                // Perform a hash table lookup only.
+                recordAddress = ramCloudHashTable[lookupRecord];
+            } else {
+                recordAddress = ramCloudHashTable[lookupRecord];
+                memset((void*)recordAddress, i + recordAddress, chunkSize);
+            }
+        }
+    }
+
+    void run(ThreadState* threadState, double seconds, size_t threadNum) {
+        LOG(INFO, "In run %lu", threadNum);
+	const uint64_t cyclesToRun = Cycles::fromSeconds(seconds);
+        //bool refreshChunks = false;
+        uint32_t start = 0;
+	PRNG prng{threadNum};
+#if defined ZIPFIAN_SETUP && ZIPFIAN_SETUP == 1
+	uint32_t zipfChunkOffset = 0;
+	uint32_t zipfDeltaOffset = 0;
+#endif
+        const uint64_t startTsc = Cycles::rdtsc();
         while (true) {
+
+#if defined ZIPFIAN_SETUP && ZIPFIAN_SETUP == 1
+	       for (size_t i = 0; i < nDeltas; ++i) {
+                  start = zipfianDeltaAddresses[threadNum][zipfDeltaOffset];
+		  ++zipfDeltaOffset;
+		  if (zipfDeltaOffset>=MAX_ZIPFIAN_ADDRESSES){
+		  zipfDeltaOffset = 0;
+		  }
+                  threadState->chunks[i].p = (void*)(logMemoryBase + (start * deltaSize));
+                  threadState->chunks[i].len = deltaSize;
+                }
+                for (size_t i = 0; i < nChunks; i++) {
+		  start = zipfianChunkAddresses[threadNum][zipfChunkOffset];
+		  ++zipfChunkOffset;
+		  if (zipfChunkOffset>=MAX_ZIPFIAN_ADDRESSES){
+		  zipfChunkOffset = 0;
+		  }
+	          threadState->chunks[i].p = (void*)(logMemoryBase + (start * chunkSize));
+                  threadState->chunks[i].len = chunkSize;
+                }
+#else
+                for (size_t i = 0; i < nDeltas; ++i) {
+                    start = prng.generate();
+                    start = start % (logSize - deltaSize);
+                    threadState->chunks[i].p = (void*)(logMemoryBase + start);
+                    threadState->chunks[i].len = deltaSize;
+                }
+
+                for (size_t i = 0; i < nChunks; ++i) {
+                    start = prng.generate();
+                    start = start % (logSize - chunkSize);
+                    threadState->chunks[i].p = (void*)(logMemoryBase + start);
+                    threadState->chunks[i].len = chunkSize;
+                }
+#endif
             //sendZeroCopy(&threadState->chunks[0], nChunks, nChunks * chunkSize,
-            //             threadState->qp.get(), doZeroCopy);
+            //             threadState->qp.get(), doZeroCopy, threadNum);
             if (doZeroCopy) {
                 sendStrictZeroCopy(&threadState->chunks[0],
                                    nDeltas + nChunks,
                                    nDeltas * deltaSize + nChunks * chunkSize,
-                                   threadState->qp.get());
+                                   threadState->qp.get(),
+                                   threadNum);
             } else {
                 sendStrictCopy(&threadState->chunks[0],
                                nDeltas + nChunks,
                                nDeltas * deltaSize + nChunks * chunkSize,
-                               threadState->qp.get());
+                               threadState->qp.get(),
+                               threadNum);
             }
-            if (Cycles::rdtsc() - start > cyclesToRun)
+            if (Cycles::rdtsc() - startTsc > cyclesToRun)
                 break;
         }
     }
@@ -1973,17 +2198,20 @@ static const char USAGE[] =
 R"(ibv-bench.
 
     Usage:
-      ibv-bench server <hostname> [--hugePages]
-      ibv-bench client <hostname>... [--hugePages] [--minChunkSize=SIZE] [--maxChunkSize=SIZE] [--minChunksPerMessage=CHUNKS] [--maxChunksPerMessage=CHUNKS] [--seconds=SECONDS] [--warmup=SECONDS]
+      ibv-bench server <hostname> [--hugePages] [--runZeroCopyOnly] [--runCopyOutOnly] [--runDeltasOnly]
+      ibv-bench client <hostname>... [--hugePages] [--runZeroCopyOnly] [--runCopyOutOnly] [--runDeltasOnly] [--minChunkSize=SIZE] [--maxChunkSize=SIZE] [--minChunksPerMessage=CHUNKS] [--maxChunksPerMessage=CHUNKS] [--seconds=SECONDS] [--warmup=SECONDS]
       ibv-bench (-h | --help)
 
     Options:
       -h --help                     Show this screen
       --hugePages                   Use huge pages
+      --runZeroCopyOnly             Don't run Copy Out mode
+      --runCopyOutOnly              Don't run Zero Copy mode
+      --runDeltasOnly               Only Run Delta Experiments
       --minChunkSize=SIZE           Smallest size of individual objects [default: 1]
-      --maxChunkSize=SIZE           Smallest size of individual objects [default: 1024]
-      --minChunksPerMessage=CHUNKS  Min Number of objects to send per send [default: 1]
-      --maxChunksPerMessage=CHUNKS  Max number of objects to send per send [default: 32]
+      --maxChunkSize=SIZE           Largest size of individual objects [default: 1024]
+      --minChunksPerMessage=CHUNKS  Min Number of objects to transmit per send [default: 1]
+      --maxChunksPerMessage=CHUNKS  Max number of objects to transmit per send [default: 32]
       --seconds=SECONDS             Number of seconds to run per chunk count/size pair [default: 10]
       --warmup=SECONDS              Number of seconds to run per chunk count/size pair before starting measurment [default: 5]
 )";
@@ -2005,6 +2233,22 @@ int main(int argc, const char** argv)
     const bool isServer = bool(args["server"]) && args["server"].asBool();
     const bool useHugePages = bool(args["--hugePages"]) &&
                               args["--hugePages"].asBool();
+    bool onlyZeroCopy =  false;
+    onlyZeroCopy = (args["--runZeroCopyOnly"]) &&
+                    args["--runZeroCopyOnly"].asBool();
+    bool onlyCopyOut = false;
+    onlyCopyOut =  (args["--runCopyOutOnly"]) &&
+                    args["--runCopyOutOnly"].asBool();
+    bool onlyDeltas = false;
+    onlyDeltas = (args["--runDeltasOnly"]) &&
+                    args["--runDeltasOnly"].asBool();
+    if (onlyDeltas && (onlyZeroCopy || onlyCopyOut)){
+      LOG(ERROR, "When using --runDeltasOnly, can't use other restrictive modes");
+    }
+    if (onlyZeroCopy && onlyCopyOut){
+        LOG(ERROR, "Can't use both --runZeroCopyOnly and --runCopyOutOnly");
+        exit(1);
+    }
     const size_t minChunkSize = args["--minChunkSize"].asLong();
     const size_t maxChunkSize = args["--maxChunkSize"].asLong();
     const size_t minChunksPerMessage = args["--minChunksPerMessage"].asLong();
@@ -2027,7 +2271,8 @@ int main(int argc, const char** argv)
         LOG(INFO, " > %s", hostName.c_str());
     LOG(INFO, "Number of client server connections: %lu", hostNames.size());
 
-    setup(isServer ? hostNames.at(0).c_str() : nullptr);
+    setup(isServer ? hostNames.at(0).c_str() : nullptr,
+        isServer ? 1 : hostNames.size());
     // Allocate a GB and register it with the HCA.
     LOG(INFO, "Registering log memory");
     void* base = nullptr;
@@ -2053,61 +2298,67 @@ int main(int argc, const char** argv)
         LOG(INFO, "Running client benchmarks");
 
         ThreadMetrics::dumpHeader();
-
-        //for (size_t chunkSize = minChunkSize;
-        //     chunkSize <= maxChunkSize;
-        //     chunkSize *= 2)
-        const std::vector<size_t> sizes{128, 1024};
-        for (size_t chunkSize : sizes)
+        if(!onlyDeltas)
         {
-            for (size_t nChunks = minChunksPerMessage;
-                 nChunks <= maxChunksPerMessage && nChunks <= 32;
-                 ++nChunks)
-            {
+                for (size_t chunkSize = minChunkSize;
+                    chunkSize <= maxChunkSize;
+                    chunkSize *= 2)
+                // const std::vector<size_t> sizes{128, 1024};
+                // for (size_t chunkSize : sizes)
                 {
-                    LOG(INFO, "Running Zero Copy on #chunks: %lu size: %lu",
-                            nChunks, chunkSize);
-                    Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
-                                    true /* 0-copy */, seconds, warmupSeconds};
-                    bench.start();
+                    for (size_t nChunks = minChunksPerMessage;
+                         nChunks <= maxChunksPerMessage && nChunks <= 32;
+                         ++nChunks)
+                    {  
+                        if(!onlyCopyOut) 
+                        {
+                            LOG(INFO, "Running Zero Copy on #chunks: %lu size: %lu",
+                                    nChunks, chunkSize);
+                            Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
+                                            true /* 0-copy */, seconds, warmupSeconds};
+                            bench.start();
+                        }
+                        if(!onlyZeroCopy)
+                        {
+                            LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
+                                    nChunks, chunkSize);
+                            Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
+                                            false /* no 0-copy */, seconds, warmupSeconds};
+                            bench.start();
+                        }
+                    }
+                    // Power of 2 number of chunks
+                    // for (size_t nChunks = 64; nChunks <= maxChunksPerMessage; nChunks *=2) {
+                    //     LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
+                    //             nChunks, chunkSize);
+                    //     Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
+                    //                     false /* doZeroCopy */, seconds, warmupSeconds};
+                    //     bench.start();
+                    // }
                 }
-                {
-                    LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
-                            nChunks, chunkSize);
-                    Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
-                                    false /* no 0-copy */, seconds, warmupSeconds};
-                    bench.start();
-                }
-            }
-            // Power of 2 number of chunks
-            for (size_t nChunks = 64; nChunks <= maxChunksPerMessage; nChunks *=2) {
-                LOG(INFO, "Running Copy-All on #chunks: %lu size: %lu",
-                        nChunks, chunkSize);
-                Benchmark bench{hostNames, nChunks, chunkSize, 0, 0,
-                                false /* doZeroCopy */, seconds, warmupSeconds};
-                bench.start();
-            }
-        }
+        } else {
 
         // Delta record tests. For these we use the command line args for
         // number of chunks for the deltas instead, and we just included a 16
         // KB base page in each trasmission no matter what.  It's all zero-copy
         // too.
-        for (size_t deltaSize : sizes)
-        {
-            for (size_t nDeltas = 0; nDeltas <= 31; ++nDeltas)
-            {
+        for (size_t deltaSize = minChunkSize;
+            deltaSize <= maxChunkSize;
+            deltaSize *= 2)
                 {
-                    LOG(INFO, "Running Deltas on #deltas: %lu size: %lu",
-                            nDeltas, deltaSize);
-                    Benchmark bench{hostNames, 1, 16384, nDeltas, deltaSize,
-                                    true /* 0-copy */, seconds, warmupSeconds};
-                    bench.start();
+                    for (size_t nDeltas = minChunksPerMessage - 1; nDeltas <= (maxChunksPerMessage - 1); ++nDeltas)
+                    {
+                        {
+                            LOG(INFO, "Running Deltas on #deltas: %lu size: %lu",
+                                    nDeltas, deltaSize);
+                            Benchmark bench{hostNames, 1, 16384, nDeltas, deltaSize,
+                                            true/*always  0-copy*/ , seconds, warmupSeconds};
+                            bench.start();
+                        }
+                    }
                 }
-            }
-        }
     }
-
+    }
     return 0;
 }
 

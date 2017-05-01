@@ -1,4 +1,5 @@
 CXXFLAGS := -std=c++14 -O3 -Idocopt.cpp -Wall -Werror
+#CXXFLAGS := -std=c++14 -O0 -g -Idocopt.cpp -Wall -Werror
 LDFLAGS := -libverbs -lpthread
 
 SRCS := $(wildcard *.cc)
@@ -18,7 +19,7 @@ docopt.o : docopt.cpp/docopt.cpp
 
 .PHONY: clean
 clean:
-	-rm *.o ibv-bench
+	-rm *.o ibv-bench 
 
-all: ibv-bench
+all: ibv-bench 
 

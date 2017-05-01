@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 
+/* Seeds obtained after sufficient offset into a single threaded run */
 static uint32_t prngInitVals[16][4] = {
   [0] = { 0xf1e86518, 0x817271fa, 0xa8268e81, 0xb8627c85 },
   [1] = { 0x18cf6e57, 0x4fd04cd5, 0xbe04c069, 0x5bdb71b1 },
@@ -52,3 +53,4 @@ std::vector<std::string> split(std::string str, char delimiter) {
 
     return internal;
 }
+

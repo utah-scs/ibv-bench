@@ -1,3 +1,6 @@
 [submodule "docopt.cpp"]
 	path = docopt.cpp
 	url = git@github.com:docopt/docopt.cpp.git
+[submodule "pmu-tools"]
+	path = pmu-tools
+	url = git@github.com:anirajk/pmu-tools.git
